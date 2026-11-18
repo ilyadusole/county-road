@@ -2,7 +2,7 @@
 
 A 3D free-roam driving sandbox for desktop browsers. Explore two connected country-road loops, cross the fields, or test the rear-wheel-drive sports car on the skidpad.
 
-[Play County Road on GitHub Pages](https://jonsole.github.io/county-road/).
+[Play County Road on GitHub Pages](https://ilyadusole.github.io/county-road/).
 
 ## Run locally
 
