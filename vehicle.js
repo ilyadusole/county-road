@@ -17,7 +17,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 export function createCar({ x = 0, z = 0, heading = 0 } = {}) {
   return {
     x, z, heading, u: 0, v: 0, yaw: 0, steer: 0, gear: 1, reverse: false,
-    rpm: 850, ax: 0, ay: 0, shiftDelay: 0, slip: 0, wheelAngle: 0,
+    rpm: 850, ax: 0, ay: 0, shiftDelay: 0, slip: 0, pavedSlip: 0, wheelAngle: 0,
   }
 }
 
@@ -26,7 +26,9 @@ export function stepCar(car, input, isPaved) {
   const speed = Math.hypot(u, v)
   const cos = Math.cos(car.heading)
   const sin = Math.sin(car.heading)
-  const steerLimit = Math.min(0.54, Math.atan2((FRONT + REAR) * 20, u ** 2 + 55))
+  // Retain enough road-wheel angle for the tyres to build cornering force at speed.
+  const highSpeedRange = 0.024 * clamp((Math.abs(u) - 25) / 20, 0, 1)
+  const steerLimit = Math.min(0.54, Math.atan2((FRONT + REAR) * 20, u ** 2 + 55) + highSpeedRange)
   const keyboardRange = input.keyboardSteering ? 1 - 0.32 * clamp((speed - 6) / 10, 0, 1) : 1
   const desiredSteer = input.steer * steerLimit * keyboardRange
   const steerRate = input.keyboardSteering ? 1.45 : 3.2
@@ -62,6 +64,7 @@ export function stepCar(car, input, isPaved) {
   let rightForce = 0
   let moment = 0
   let rearSlip = 0
+  let pavedSlip = 0
 
   for (const [side, forwardOffset] of WHEELS) {
     const front = forwardOffset > 0
@@ -87,12 +90,15 @@ export function stepCar(car, input, isPaved) {
     forwardForce += localForward
     rightForce += localRight
     moment += forwardOffset * localRight - rightOffset * localForward
-    if (!front) rearSlip = Math.max(rearSlip, Math.abs(slipAngle))
+    const contactSlip = Math.abs(slipAngle)
+    if (!front) rearSlip = Math.max(rearSlip, contactSlip)
+    if (paved) pavedSlip = Math.max(pavedSlip, contactSlip)
   }
 
   car.ax += (forwardForce / MASS - car.ax) * 0.08
   car.ay += (rightForce / MASS - car.ay) * 0.08
   car.slip = rearSlip
+  car.pavedSlip = pavedSlip
   car.u += (forwardForce / MASS + yaw * v) * STEP
   car.v += (rightForce / MASS - yaw * u) * STEP
   car.yaw += moment / INERTIA * STEP
