@@ -21,11 +21,15 @@ try {
 }
 renderer.toneMapping = T.ACESFilmicToneMapping
 view.append(renderer.domElement)
+const touch = createTouchDriving(select('game'))
+const drivingAudio = createDrivingAudio(select('open-settings'))
 
 function resize() {
   const { clientWidth, clientHeight } = view
   if (!clientWidth || !clientHeight) return
-  const pixelRatio = Math.min(devicePixelRatio, 1.25, Math.sqrt(MAX_RENDER_PIXELS / (clientWidth * clientHeight)))
+  const mobile = touch.isActive()
+  const pixelBudget = mobile ? 1024 * 768 : MAX_RENDER_PIXELS
+  const pixelRatio = Math.min(devicePixelRatio, mobile ? 1 : 1.25, Math.sqrt(pixelBudget / (clientWidth * clientHeight)))
   renderer.setDrawingBufferSize(clientWidth, clientHeight, pixelRatio)
   camera.aspect = clientWidth / clientHeight
   camera.updateProjectionMatrix()
@@ -184,8 +188,13 @@ renderer.setAnimationLoop(now => {
   const delta = Math.max(0, Math.min(0.1, (now - last) / 1000))
   last = now
   input = controls()
+  const paused = settings.isOpen()
+  touch.apply(input, paused)
   settings.update(input.devices)
-  if (settings.isOpen()) return
+  if (paused) {
+    drivingAudio.update(now, car, 0, true)
+    return
+  }
   if (input.reset) recover('Recovered to the nearest road')
   if (input.reverse) {
     if (Math.hypot(car.u, car.v) < 0.5) {
@@ -197,9 +206,278 @@ renderer.setAnimationLoop(now => {
     }
   }
   const fraction = advance(delta)
+  drivingAudio.update(now, car, input.throttle, false)
   interpolateCarPose(previousCar, car, fraction, pose)
   renderCar()
   updateCamera(delta)
   updateHud(now)
   renderer.render(scene, camera)
 })
+
+function createDrivingAudio(settingsButton) {
+  const toolbar = document.createElement('div')
+  toolbar.className = 'drive-toolbar'
+  settingsButton.before(toolbar)
+  toolbar.append(settingsButton)
+  const Audio = window.AudioContext || window.webkitAudioContext
+  if (!Audio) return { update() {} }
+
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'settings-toggle'
+  button.textContent = 'Enable sound'
+  toolbar.append(button)
+  let graph
+  let enabled = false
+  let audible = false
+  let lastMix = -Infinity
+
+  function buildGraph(context) {
+    const master = context.createGain()
+    master.gain.value = 0
+    master.connect(context.destination)
+    const engine = context.createOscillator()
+    // The second harmonic represents two combustion pulses per crank revolution.
+    const harmonics = new Float32Array([0, 0.32, 1, 0.12, 0.49, 0.08, 0.23, 0.045, 0.13])
+    engine.setPeriodicWave(context.createPeriodicWave(new Float32Array(harmonics.length), harmonics))
+    const noise = context.createBufferSource()
+    noise.buffer = context.createBuffer(1, context.sampleRate * 2, context.sampleRate)
+    const samples = noise.buffer.getChannelData(0)
+    for (let i = 0; i < samples.length; i++) samples[i] = Math.random() * 2 - 1
+    noise.loop = true
+
+    function voice(source, type, frequency, resonance) {
+      const filter = context.createBiquadFilter()
+      filter.type = type
+      filter.frequency.value = frequency
+      filter.Q.value = resonance
+      const level = context.createGain()
+      level.gain.value = 0
+      source.connect(filter)
+      filter.connect(level)
+      level.connect(master)
+      return { frequency: filter.frequency, level: level.gain }
+    }
+
+    const exhaust = voice(engine, 'lowpass', 260, 0.7)
+    const rolling = voice(noise, 'bandpass', 1150, 0.65)
+    const sliding = voice(noise, 'bandpass', 1750, 3)
+    engine.start()
+    noise.start()
+    return { context, master: master.gain, pitch: engine.frequency, exhaust, rolling, sliding }
+  }
+
+  function fade(play) {
+    if (!graph || audible === play) return
+    audible = play
+    graph.master.setTargetAtTime(play ? 0.62 : 0, graph.context.currentTime, 0.035)
+  }
+
+  button.addEventListener('click', async () => {
+    if (enabled) {
+      enabled = false
+      fade(false)
+      button.textContent = 'Unmute sound'
+      return
+    }
+    button.disabled = true
+    try {
+      graph ??= buildGraph(new Audio())
+      await graph.context.resume()
+      enabled = true
+      button.textContent = 'Mute sound'
+    } catch {
+      button.textContent = 'Retry sound'
+    } finally {
+      button.disabled = false
+    }
+  })
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) fade(false)
+  })
+
+  return {
+    update(now, car, throttle, paused) {
+      const play = enabled && !paused && !document.hidden
+      fade(play)
+      if (!play || now - lastMix < 1000 / 30) return
+      lastMix = now
+      const { context, pitch, exhaust, rolling, sliding } = graph
+      const time = context.currentTime
+      const speed = Math.hypot(car.u, car.v)
+      const road = isPaved(car.x, car.z)
+      const load = car.shiftDelay > 0.1 ? throttle * 0.38 : throttle
+      const motion = Math.min(1, speed / 34)
+      const slip = Math.min(1, Math.max(0, (car.slip - 0.11) / 0.28))
+      pitch.setTargetAtTime(car.rpm / 60, time, 0.032)
+      exhaust.frequency.setTargetAtTime(220 + car.rpm * 0.07 + load * 580, time, 0.065)
+      exhaust.level.setTargetAtTime(0.075 + load * 0.19 + car.rpm * 0.000007, time, 0.065)
+      rolling.frequency.setTargetAtTime((road ? 830 : 370) + motion * 470, time, 0.08)
+      rolling.level.setTargetAtTime(motion * (road ? 0.12 : 0.28), time, 0.075)
+      sliding.level.setTargetAtTime(road ? slip * Math.min(1, speed / 9) * 0.28 : 0, time, 0.055)
+    },
+  }
+}
+
+function createTouchDriving(game) {
+  const style = document.createElement('style')
+  style.textContent = `
+    .drive-toolbar { display: flex; flex-wrap: wrap; gap: 0 6px; }
+    .touch-game {
+      height: 100dvh;
+      bottom: auto;
+      --touch-size: clamp(52px, min(15vw, 18dvh), 80px);
+      --touch-left: max(12px, env(safe-area-inset-left, 0px));
+      --touch-right: max(12px, env(safe-area-inset-right, 0px));
+      --touch-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+      --touch-top: max(10px, env(safe-area-inset-top, 0px));
+    }
+    .touch-game .controls, .touch-game #open-settings kbd { display: none; }
+    .touch-game .title { top: var(--touch-top); left: var(--touch-left); padding: 8px 10px 9px; }
+    .touch-game .title h1 { font-size: 20px; }
+    .touch-game .drive-toolbar button { min-height: 36px; margin-top: 6px; }
+    .touch-game .map { top: var(--touch-top); right: var(--touch-right); padding: 6px 8px; }
+    .touch-game #map { width: clamp(64px, 19vw, 102px); }
+    .touch-game .dash {
+      bottom: calc(var(--touch-bottom) + var(--touch-size) + 53px);
+      right: var(--touch-right);
+      width: 124px;
+      padding: 7px 8px;
+      gap: 5px;
+    }
+    .touch-game #speed { font-size: 30px; }
+    .touch-game #notice { top: 30%; width: max-content; max-width: 75%; }
+    .touch-driving { position: absolute; inset: 0; pointer-events: none; }
+    .touch-driving > div { position: absolute; display: flex; gap: 7px; }
+    .touch-driving .steering { left: var(--touch-left); bottom: var(--touch-bottom); }
+    .touch-driving .pedals { right: var(--touch-right); bottom: var(--touch-bottom); }
+    .touch-driving .drive-actions {
+      right: var(--touch-right);
+      bottom: calc(var(--touch-bottom) + var(--touch-size) + 7px);
+    }
+    .touch-driving button {
+      pointer-events: auto;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+      width: var(--touch-size);
+      height: var(--touch-size);
+      border-radius: 12px;
+      border-color: #ffffff60;
+      background: #121b17e0;
+      padding: 0;
+    }
+    .touch-driving .steering button { font-size: 24px; }
+    .touch-driving .accelerate { color: var(--accent); }
+    .touch-driving .drive-actions button { height: 44px; font-size: 11px; }
+    .touch-driving button[data-held], .touch-driving button:active { color: #232318; background: var(--accent); }
+    @media (orientation: landscape) {
+      .touch-game .dash { bottom: var(--touch-bottom); left: 50%; right: auto; transform: translateX(-50%); }
+      .touch-game #map { width: clamp(64px, 20dvh, 102px); }
+    }
+  `
+  document.head.append(style)
+
+  const pointer = matchMedia('(any-pointer: coarse)')
+  const landscape = matchMedia('(orientation: landscape)')
+  const overlay = document.createElement('section')
+  overlay.className = 'touch-driving'
+  overlay.setAttribute('aria-label', 'On-screen driving controls')
+  const held = new Map()
+  let reverse = false
+  let recover = false
+  let active = false
+
+  function clear() {
+    for (const control of held.values()) control.removeAttribute('data-held')
+    held.clear()
+    reverse = false
+    recover = false
+  }
+
+  function updateAvailability() {
+    active = pointer.matches || (navigator.maxTouchPoints > 0 && matchMedia('(hover: none)').matches)
+    overlay.hidden = !active
+    game.classList.toggle('touch-game', active)
+    if (!active) clear()
+  }
+
+  function controls(className, items) {
+    const group = document.createElement('div')
+    group.className = className
+    for (const [action, text, label, tap] of items) {
+      const control = document.createElement('button')
+      control.type = 'button'
+      control.textContent = text
+      control.className = action
+      control.setAttribute('aria-label', label)
+      control.addEventListener('contextmenu', event => event.preventDefault())
+      if (tap) {
+        control.addEventListener('click', tap)
+      } else {
+        control.addEventListener('pointerdown', event => {
+          if (event.button !== 0) return
+          event.preventDefault()
+          control.setPointerCapture(event.pointerId)
+          held.set(event.pointerId, control)
+          control.setAttribute('data-held', '')
+        })
+        const release = event => {
+          held.delete(event.pointerId)
+          if (![...held.values()].includes(control)) control.removeAttribute('data-held')
+        }
+        for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+          control.addEventListener(event, release)
+        }
+      }
+      group.append(control)
+    }
+    overlay.append(group)
+  }
+
+  controls('steering', [['left', '←', 'Steer left'], ['right', '→', 'Steer right']])
+  controls('pedals', [['brake', 'Brake', 'Brake'], ['accelerate', 'Gas', 'Accelerate']])
+  controls('drive-actions', [
+    ['reverse', 'Reverse', 'Toggle drive or reverse', () => { reverse = true }],
+    ['recover', 'Recover', 'Recover to the nearest road', () => { recover = true }],
+  ])
+  game.append(overlay)
+  updateAvailability()
+  pointer.addEventListener('change', () => {
+    updateAvailability()
+    resize()
+  })
+  landscape.addEventListener('change', clear)
+  window.addEventListener('blur', clear)
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) clear()
+  })
+
+  return {
+    isActive: () => active,
+    apply(input, paused) {
+      if (paused || !active) {
+        clear()
+        return
+      }
+      let left = false
+      let right = false
+      for (const { className } of held.values()) {
+        if (className === 'left') left = true
+        if (className === 'right') right = true
+        if (className === 'brake') input.brake = 1
+        if (className === 'accelerate') input.throttle = 1
+      }
+      if (left || right) {
+        input.steer = Number(right) - Number(left)
+        input.keyboardSteering = true
+      }
+      input.reverse ||= reverse
+      input.reset ||= recover
+      reverse = false
+      recover = false
+    },
+  }
+}
