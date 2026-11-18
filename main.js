@@ -1,7 +1,7 @@
 import * as T from 'three'
 import { createControls, deviceKey, loadBindings } from './controls.js'
 import { createSettings, keyLabel } from './settings.js'
-import { createCar, createStepper, interpolateCarPose, stepCar } from './vehicle.js'
+import { createCar, createStepper, interpolateCarPose, shiftGear, stepCar } from './vehicle.js'
 import { HALF_WORLD, LANDMARKS, PAD, SPAWN, isPaved, nearestRoad, resolveLandmarks, roads } from './roads.js'
 import { buildCar, buildWorld } from './scenery.js'
 
@@ -77,6 +77,12 @@ for (const { x, z, radius = 2.6 } of [...LANDMARKS, { ...PAD, radius: PAD.radius
 }
 
 let car = createCar(SPAWN)
+const gearboxButton = document.createElement('button')
+gearboxButton.type = 'button'
+gearboxButton.className = 'settings-toggle'
+select('open-settings').parentElement.append(gearboxButton)
+gearboxButton.addEventListener('click', () => setManualMode(!car.manual))
+setManualMode(false)
 const previousCar = { ...car }
 const pose = {}
 let input = controls()
@@ -89,9 +95,16 @@ let lastMapX, lastMapZ, lastMapHeading
 const focus = new T.Vector3()
 updateBindingHints()
 
+function setManualMode(manual) {
+  car.manual = manual
+  gearboxButton.textContent = manual ? 'Manual gears' : 'Auto gears'
+  gearboxButton.title = manual ? 'Switch to automatic gears' : 'Switch to manual gears'
+  touch.showManual(manual)
+}
+
 function updateBindingHints() {
   const label = action => keyLabel(bindings.keys[action].find(Boolean))
-  select('keyboard-hint').textContent = `Keyboard · ${label('throttle')} throttle · ${label('brake')} brake · ${label('left')} / ${label('right')} steer · ${label('reverse')} reverse · ${label('reset')} recover`
+  select('keyboard-hint').textContent = `Keyboard · ${label('throttle')} throttle · ${label('brake')} brake · ${label('left')} / ${label('right')} steer · ${label('reverse')} reverse · ${label('reset')} recover · ${label('gearbox')} gearbox · ${label('shiftDown')} / ${label('shiftUp')} shift`
 }
 
 function announce(message) {
@@ -101,7 +114,9 @@ function announce(message) {
 }
 
 function recover(message) {
+  const manual = car.manual
   car = createCar(nearestRoad(car.x, car.z, car.heading))
+  car.manual = manual
   Object.assign(previousCar, car)
   cameraYaw = undefined
   announce(message)
@@ -144,7 +159,7 @@ function updateHud(now) {
   if (now - lastHudAt < 50) return
   lastHudAt = now
   const speedLabel = String(Math.round(Math.hypot(car.u, car.v) * 3.6))
-  const gearLabel = car.reverse ? 'R' : String(car.gear)
+  const gearLabel = car.reverse ? 'R' : car.gear === 0 ? 'N' : String(car.gear)
   const rpmPercent = Math.round(car.rpm / 69)
   if (speed.textContent !== speedLabel) speed.textContent = speedLabel
   if (gear.textContent !== gearLabel) gear.textContent = gearLabel
@@ -196,6 +211,7 @@ renderer.setAnimationLoop(now => {
     return
   }
   if (input.reset) recover('Recovered to the nearest road')
+  if (input.gearbox) setManualMode(!car.manual)
   if (input.reverse) {
     if (Math.hypot(car.u, car.v) < 0.5) {
       car.reverse = !car.reverse
@@ -205,6 +221,7 @@ renderer.setAnimationLoop(now => {
       announce('Stop before changing direction')
     }
   }
+  if (input.shiftUp !== input.shiftDown) shiftGear(car, input.shiftUp ? 1 : -1)
   const fraction = advance(delta)
   drivingAudio.update(now, car, input, false)
   interpolateCarPose(previousCar, car, fraction, pose)
@@ -221,6 +238,15 @@ function createDrivingAudio(settingsButton) {
   toolbar.append(settingsButton)
   const Audio = window.AudioContext || window.webkitAudioContext
   if (!Audio) return { update() {} }
+  const root = import.meta.env.BASE_URL + 'audio/'
+  const credits = document.createElement('a')
+  credits.className = 'audio-credits'
+  credits.href = root + 'credits.txt'
+  credits.target = '_blank'
+  credits.rel = 'noopener'
+  credits.textContent = 'Audio credits'
+  credits.hidden = true
+  select('settings').querySelector('.settings-footer').append(credits)
 
   const button = document.createElement('button')
   button.type = 'button'
@@ -231,6 +257,9 @@ function createDrivingAudio(settingsButton) {
   let enabled = false
   let audible = false
   let lastMix = -Infinity
+  let lastThrottle = 0
+  let revUntil = 0
+  let revSource
 
   function buildGraph(context) {
     const master = context.createGain()
@@ -266,7 +295,10 @@ function createDrivingAudio(settingsButton) {
     const braking = voice(noise, 'bandpass', 900, 1.6)
     engine.start()
     noise.start()
-    return { context, master: master.gain, pitch: engine.frequency, exhaust, rolling, sliding, intake, braking }
+    return {
+      context, master: master.gain, output: master, pitch: engine.frequency,
+      exhaust, rolling, sliding, intake, braking, recordings: {}, engines: [],
+    }
   }
 
   function fade(play) {
@@ -284,8 +316,15 @@ function createDrivingAudio(settingsButton) {
     }
     button.disabled = true
     try {
+      const firstStart = !graph
       graph ??= buildGraph(new Audio())
       await graph.context.resume()
+      if (firstStart) {
+        void loadCarRecordings(graph, root).then(count => {
+          credits.hidden = count === 0
+          button.title = count ? count + ' of 6 recorded car sounds loaded' : 'Synthesised audio'
+        })
+      }
       enabled = true
       button.textContent = 'Mute sound'
     } catch {
@@ -312,18 +351,175 @@ function createDrivingAudio(settingsButton) {
       const load = car.shiftDelay > 0.1 ? throttle * 0.38 : throttle
       const motion = Math.min(1, speed / 34)
       const slip = Math.min(1, Math.max(0, (car.pavedSlip - 0.045) / 0.17))
+      const { recordings } = graph
+      if ((car.gear !== 0 || car.reverse) && revSource) {
+        revSource.stop()
+        revSource = undefined
+        revUntil = 0
+      }
+      if (car.gear === 0 && !car.reverse && throttle > 0.75 && lastThrottle < 0.3 && time >= revUntil && recordings.rev) {
+        const source = context.createBufferSource()
+        const level = context.createGain()
+        source.buffer = recordings.rev
+        source.connect(level)
+        level.gain.value = 0.55
+        level.connect(graph.output)
+        source.addEventListener('ended', () => {
+          source.disconnect()
+          level.disconnect()
+          if (revSource === source) revSource = undefined
+        }, { once: true })
+        source.start()
+        revSource = source
+        revUntil = time + recordings.rev.duration
+      }
+      lastThrottle = throttle
+      const hasEngines = graph.engines.length >= 2
+      const normalGain = time < revUntil ? 0.3 : 1
+      if (hasEngines) mixRecordedEngine(graph, car.rpm, normalGain * (0.68 + load * 0.62), time)
+      const synth = hasEngines ? 0.16 : normalGain
       pitch.setTargetAtTime(car.rpm / 60, time, 0.032)
       exhaust.frequency.setTargetAtTime(270 + car.rpm * 0.12 + load * 1100, time, 0.065)
-      exhaust.level.setTargetAtTime(0.12 + load * 0.30 + car.rpm * 0.000014, time, 0.065)
+      exhaust.level.setTargetAtTime(synth * (0.12 + load * 0.30 + car.rpm * 0.000014), time, 0.065)
       intake.frequency.setTargetAtTime(540 + car.rpm * 0.15, time, 0.07)
-      intake.level.setTargetAtTime(load * (0.045 + car.rpm * 0.000012), time, 0.07)
+      intake.level.setTargetAtTime(synth * load * (0.045 + car.rpm * 0.000012), time, 0.07)
       rolling.frequency.setTargetAtTime((road ? 830 : 370) + motion * 470, time, 0.08)
       rolling.level.setTargetAtTime(motion * (road ? 0.12 : 0.28), time, 0.075)
       sliding.frequency.setTargetAtTime(1450 + slip * 650 + motion * 180, time, 0.06)
-      sliding.level.setTargetAtTime(slip * Math.min(1, speed / 8) * 0.42, time, 0.05)
+      const squeal = slip * Math.min(1, speed / 8)
+      sliding.level.setTargetAtTime(squeal * (recordings.tyre ? 0.08 : 0.42), time, 0.05)
+      recordings.tyre?.level.setTargetAtTime(squeal * 0.68, time, 0.05)
       braking.frequency.setTargetAtTime(720 + motion * 630, time, 0.09)
-      braking.level.setTargetAtTime(brake * Math.min(1, speed / 8) * 0.11, time, 0.075)
+      const brakeNoise = brake * Math.min(1, speed / 8)
+      braking.level.setTargetAtTime(brakeNoise * (recordings.brake ? 0.025 : 0.11), time, 0.075)
+      recordings.brake?.level.setTargetAtTime(brakeNoise * 0.32, time, 0.075)
     },
+  }
+}
+
+function cutRecordingLoop(context, buffer, seconds, targetRpm) {
+  const samples = buffer.getChannelData(0)
+  const rate = buffer.sampleRate
+  const length = Math.min(samples.length, Math.round(seconds * rate))
+  const hop = Math.max(1, Math.round(rate / 4800))
+  const period = targetRpm ? rate * 20 / targetRpm : 0
+  const periods = targetRpm ? [0.84, 0.92, 1, 1.09, 1.19].map(factor => Math.round(period * factor)) : []
+  const windowStep = Math.round(rate * (targetRpm ? 0.6 : 0.15))
+  let offset = 0
+  let rpm = targetRpm
+  let best = -Infinity
+  for (let start = 0; start + length <= samples.length; start += windowStep) {
+    const end = start + length
+    if (targetRpm) {
+      // Find a repeating exhaust waveform near the target V6 firing rate.
+      for (const lag of periods) {
+        let cross = 0
+        let leftPower = 0
+        let rightPower = 0
+        for (let i = start + lag; i < end; i += hop * 2) {
+          const a = samples[i]
+          const b = samples[i - lag]
+          cross += a * b
+          leftPower += a * a
+          rightPower += b * b
+        }
+        const energy = Math.sqrt(leftPower * rightPower)
+        if (energy < 0.015) continue
+        const score = cross / energy - 0.32 * Math.abs(Math.log(lag / period))
+          + 0.03 * Math.log1p(energy)
+        if (score > best) {
+          best = score
+          offset = start
+          rpm = rate * 20 / lag
+        }
+      }
+    } else {
+      // Prefer the bright friction sound over the approaching engine rumble.
+      let edgePower = 0
+      for (let i = start + hop; i < end; i += hop) edgePower += (samples[i] - samples[i - hop]) ** 2
+      if (edgePower > best) {
+        best = edgePower
+        offset = start
+      }
+    }
+  }
+  let power = 0
+  let peak = 0
+  for (let i = 0; i < length; i++) {
+    const sample = samples[offset + i]
+    power += sample * sample
+    peak = Math.max(peak, Math.abs(sample))
+  }
+  const scale = Math.min(4, 0.22 / Math.sqrt(power / length), 0.92 / peak)
+  const overlap = Math.min(Math.floor(length / 5), Math.round(rate * 0.065))
+  const loop = context.createBuffer(1, length - overlap, rate)
+  const data = loop.getChannelData(0)
+  data.set(samples.subarray(offset + overlap, offset + length))
+  // Blend into the omitted start so the end rejoins the first frame smoothly.
+  for (let i = 0; i < overlap; i++) {
+    const index = data.length - overlap + i
+    const blend = i / Math.max(1, overlap - 1)
+    data[index] = data[index] * (1 - blend) + samples[offset + i] * blend
+  }
+  for (let i = 0; i < data.length; i++) data[i] *= scale
+  return { loop, rpm }
+}
+
+async function loadCarRecordings(graph, root) {
+  const { context, output } = graph
+  const clips = [
+    ['idle', 1.4, 850], ['mid', 1.1, 2900], ['high', 1.1, 5300],
+    ['tyre', 0.65, 0, 950], ['brake', 0.52, 0, 650], ['rev'],
+  ]
+  let count = 0
+  for (const [name, duration, targetRpm, highpass] of clips) {
+    try {
+      const response = await fetch(root + name + '.mp3')
+      if (!response.ok) throw Error('HTTP ' + response.status)
+      const original = await context.decodeAudioData(await response.arrayBuffer())
+      if (duration) {
+        const { loop, rpm } = cutRecordingLoop(context, original, duration, targetRpm)
+        const source = context.createBufferSource()
+        const gain = context.createGain()
+        source.buffer = loop
+        source.loop = true
+        gain.gain.value = 0
+        source.connect(gain)
+        if (highpass) {
+          const filter = context.createBiquadFilter()
+          filter.type = 'highpass'
+          filter.frequency.value = highpass
+          gain.connect(filter)
+          filter.connect(output)
+        } else {
+          gain.connect(output)
+        }
+        source.start()
+        const recording = { speed: source.playbackRate, level: gain.gain, rpm }
+        if (targetRpm) graph.engines.push(recording)
+        else graph.recordings[name] = recording
+      } else {
+        graph.recordings.rev = original
+      }
+      count++
+    } catch (error) {
+      console.warn('Could not load recorded car sound ' + name, error)
+    }
+  }
+  return count
+}
+
+function mixRecordedEngine(graph, rpm, gain, time) {
+  const { engines } = graph
+  const next = engines.findIndex(engine => engine.rpm >= rpm)
+  const upper = next < 0 ? engines.length - 1 : next
+  const lower = next <= 0 ? upper : upper - 1
+  const span = engines[upper].rpm - engines[lower].rpm
+  const blend = span ? (rpm - engines[lower].rpm) / span : 0
+  for (const [index, engine] of engines.entries()) {
+    const weight = index === lower ? Math.sqrt(1 - blend) : index === upper ? Math.sqrt(blend) : 0
+    engine.speed.setTargetAtTime(Math.min(2, Math.max(0.55, rpm / engine.rpm)), time, 0.035)
+    engine.level.setTargetAtTime(weight * gain, time, 0.05)
   }
 }
 
@@ -379,7 +575,14 @@ function createTouchDriving(game) {
     }
     .touch-driving .steering button { font-size: 24px; }
     .touch-driving .accelerate { color: var(--accent); }
-    .touch-driving .drive-actions button { height: 44px; font-size: 11px; }
+    .touch-driving .shift-actions {
+      left: var(--touch-left);
+      bottom: calc(var(--touch-bottom) + var(--touch-size) + 7px);
+    }
+    .touch-driving .drive-actions button, .touch-driving .shift-actions button { height: 44px; font-size: 11px; }
+    .drive-toolbar .settings-toggle { white-space: nowrap; }
+    .touch-game .drive-toolbar { max-width: 195px; }
+    .audio-credits { color: var(--muted); }
     .touch-driving button[data-held], .touch-driving button:active { color: #232318; background: var(--accent); }
     @media (orientation: landscape) {
       .touch-game .dash { bottom: var(--touch-bottom); left: 50%; right: auto; transform: translateX(-50%); }
@@ -396,6 +599,7 @@ function createTouchDriving(game) {
   const held = new Map()
   let reverse = false
   let recover = false
+  let shift = 0
   let active = false
 
   function clear() {
@@ -403,6 +607,7 @@ function createTouchDriving(game) {
     held.clear()
     reverse = false
     recover = false
+    shift = 0
   }
 
   function updateAvailability() {
@@ -443,6 +648,7 @@ function createTouchDriving(game) {
       group.append(control)
     }
     overlay.append(group)
+    return group
   }
 
   controls('steering', [['left', '←', 'Steer left'], ['right', '→', 'Steer right']])
@@ -451,6 +657,11 @@ function createTouchDriving(game) {
     ['reverse', 'Reverse', 'Toggle drive or reverse', () => { reverse = true }],
     ['recover', 'Recover', 'Recover to the nearest road', () => { recover = true }],
   ])
+  const shiftButtons = controls('shift-actions', [
+    ['downshift', 'Gear −', 'Shift down', () => { shift = -1 }],
+    ['upshift', 'Gear +', 'Shift up', () => { shift = 1 }],
+  ])
+  shiftButtons.hidden = true
   game.append(overlay)
   updateAvailability()
   pointer.addEventListener('change', () => {
@@ -465,6 +676,7 @@ function createTouchDriving(game) {
 
   return {
     isActive: () => active,
+    showManual(manual) { shiftButtons.hidden = !manual },
     apply(input, paused) {
       if (paused || !active) {
         clear()
@@ -484,8 +696,11 @@ function createTouchDriving(game) {
       }
       input.reverse ||= reverse
       input.reset ||= recover
+      input.shiftDown ||= shift < 0
+      input.shiftUp ||= shift > 0
       reverse = false
       recover = false
+      shift = 0
     },
   }
 }
