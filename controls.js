@@ -81,9 +81,34 @@ export function deviceKey(device) {
   return `${device.mapping}:${device.id || `${device.axes.length} axes/${device.buttons.length} buttons`}`
 }
 
+function deduplicateFanatec(devices) {
+  const unique = []
+  const layouts = new Map()
+  const reportsInput = device => device.axes.some(value => Math.abs(value) > 0.0001)
+    || device.buttons.some(button => button.pressed || button.value > 0.0001)
+
+  for (const device of devices) {
+    if (!/fanatec|vendor:\s*0eb7/i.test(device.id)) {
+      unique.push(device)
+      continue
+    }
+    const key = `${deviceKey(device)}:${device.axes.length}/${device.buttons.length}`
+    const index = layouts.get(key)
+    if (index === undefined) {
+      layouts.set(key, unique.length)
+      unique.push(device)
+    } else if (!reportsInput(unique[index]) && reportsInput(device)) {
+      // Some Fanatec bases expose an all-zero duplicate alongside the real controls.
+      unique[index] = device
+    }
+  }
+  return unique
+}
+
 export function getDevices() {
   try {
-    return Array.from(navigator.getGamepads?.() ?? []).filter(device => device?.connected)
+    const devices = Array.from(navigator.getGamepads?.() ?? []).filter(device => device?.connected)
+    return devices.length < 2 ? devices : deduplicateFanatec(devices)
   } catch {
     return []
   }
