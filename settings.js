@@ -193,7 +193,7 @@ export function createSettings(config, onChange) {
           label.append(invert, ' Invert')
           calibration.append(label)
         }
-        const label = element('label', undefined, 'deadzone')
+        const deadzoneLabel = element('label', undefined, 'deadzone')
         const deadzone = element('input')
         deadzone.type = 'number'
         deadzone.min = 0
@@ -206,8 +206,8 @@ export function createSettings(config, onChange) {
           setBinding(device, action, { ...deviceBindings(config, device)[action], deadzone: Number(deadzone.value) / 100 })
           save()
         })
-        label.append('Dead zone ', deadzone, '%')
-        calibration.append(label)
+        deadzoneLabel.append('Dead zone ', deadzone, '%')
+        calibration.append(deadzoneLabel)
         row.append(calibration)
       }
       bindingRows.append(row)
