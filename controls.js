@@ -1,14 +1,20 @@
 export const KEY_ACTIONS = {
   left: 'Steer left', right: 'Steer right', throttle: 'Throttle', brake: 'Brake',
   reverse: 'Toggle reverse', reset: 'Recover car',
+  shiftDown: 'Shift down', shiftUp: 'Shift up', gearbox: 'Toggle manual gearbox',
 }
 export const DEVICE_ACTIONS = {
   steer: 'Steering', throttle: 'Throttle', brake: 'Brake', lookX: 'Look left / right',
   lookY: 'Look up / down', reverse: 'Toggle reverse', reset: 'Recover car',
+  shiftDown: 'Shift down', shiftUp: 'Shift up', gearbox: 'Toggle manual gearbox',
 }
 export const centeredAction = action => action === 'steer' || action === 'lookX' || action === 'lookY'
-export const buttonAction = action => action === 'reverse' || action === 'reset'
-const ZERO = { steer: 0, throttle: 0, brake: 0, lookX: 0, lookY: 0, reverse: false, reset: false }
+const PULSE_ACTIONS = ['reverse', 'reset', 'shiftDown', 'shiftUp', 'gearbox']
+export const buttonAction = action => PULSE_ACTIONS.includes(action)
+const ZERO = {
+  steer: 0, throttle: 0, brake: 0, lookX: 0, lookY: 0,
+  reverse: false, reset: false, shiftDown: false, shiftUp: false, gearbox: false,
+}
 const STORAGE_KEY = 'county-road-controls-v1'
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value))
 
@@ -17,6 +23,7 @@ export function defaultKeys() {
     left: ['KeyA', 'ArrowLeft'], right: ['KeyD', 'ArrowRight'],
     throttle: ['KeyW', 'ArrowUp'], brake: ['KeyS', 'ArrowDown'],
     reverse: ['KeyF', null], reset: ['KeyR', null],
+    shiftDown: ['KeyQ', null], shiftUp: ['KeyE', null], gearbox: ['KeyM', null],
   }
 }
 
@@ -153,7 +160,7 @@ export function createControls(config = loadBindings(), isPaused = () => false) 
       previous = input
       return { ...ZERO, connected, devices }
     }
-    const hasInput = (action, set = keys) => config.keys[action].some(code => set.has(code))
+    const hasInput = (action, set = keys) => config.keys[action]?.some(code => set.has(code)) ?? false
     const keySteer = Number(hasInput('right')) - Number(hasInput('left'))
     const keyboardSteering = input.steer === 0 && keySteer !== 0
     const output = {
@@ -161,8 +168,9 @@ export function createControls(config = loadBindings(), isPaused = () => false) 
       steer: keyboardSteering ? keySteer : input.steer,
       throttle: Math.max(input.throttle, Number(hasInput('throttle'))),
       brake: Math.max(input.brake, Number(hasInput('brake'))),
-      reset: hasInput('reset', taps) || (input.reset && !previous.reset),
-      reverse: hasInput('reverse', taps) || (input.reverse && !previous.reverse),
+    }
+    for (const action of PULSE_ACTIONS) {
+      output[action] = hasInput(action, taps) || (input[action] && !previous[action])
     }
     taps.clear()
     previous = input
