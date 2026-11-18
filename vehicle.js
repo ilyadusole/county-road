@@ -9,6 +9,7 @@ const GRAVITY = 9.81
 const GEARS = [3.42, 2.23, 1.58, 1.19, 0.94, 0.77]
 const FINAL_DRIVE = 3.63
 const WHEEL_RADIUS = 0.33
+const NEUTRAL_IDLE_RPM = 700
 const WHEELS = [[-1, FRONT], [1, FRONT], [-1, -REAR], [1, -REAR]]
 export const STEP = 1 / 120
 export const NEUTRAL = { steer: 0, throttle: 0, brake: 0 }
@@ -24,11 +25,16 @@ export function createCar({ x = 0, z = 0, heading = 0 } = {}) {
 const wheelRpmAt = speed => Math.abs(speed) * 60 / (2 * Math.PI * WHEEL_RADIUS)
 
 export function shiftGear(car, direction) {
-  if (!car.manual || car.reverse || car.shiftDelay > 0.06) return
-  const gear = clamp(car.gear + direction, 0, GEARS.length)
-  if (gear === car.gear) return
-  if (direction < 0 && gear > 0 && wheelRpmAt(car.u) * GEARS[gear - 1] * FINAL_DRIVE > 6900) return
-  car.gear = gear
+  if (!car.manual || car.shiftDelay > 0.06) return
+  const current = car.reverse ? -1 : car.gear
+  const gear = clamp(current + direction, -1, GEARS.length)
+  if (gear === current) return
+  if (gear === -1 && Math.hypot(car.u, car.v) >= 0.5) return
+  if (current === 0 && gear === 1 && car.u <= -0.5) return
+  if (gear > 0 && (direction < 0 || current === 0)
+    && wheelRpmAt(car.u) * GEARS[gear - 1] * FINAL_DRIVE > 6900) return
+  car.reverse = gear < 0
+  car.gear = Math.max(0, gear)
   car.shiftDelay = 0.18
 }
 
@@ -65,8 +71,9 @@ export function stepCar(car, input, isPaved) {
     }
   }
   const ratio = (car.reverse ? 3.25 : GEARS[car.gear - 1] ?? 0) * FINAL_DRIVE
+  const neutralRpm = NEUTRAL_IDLE_RPM + (6900 - NEUTRAL_IDLE_RPM) * input.throttle
   car.rpm = ratio === 0
-    ? car.rpm + (850 + 6050 * input.throttle - car.rpm) * 0.07
+    ? car.rpm + (neutralRpm - car.rpm) * 0.07
     : clamp(wheelRpm * ratio, 850, 6900)
   const torque = 445 * (0.77 + 0.23 * Math.sin(Math.PI * car.rpm / 7600))
   const limiter = clamp((7000 - car.rpm) / 650, 0, 1) * (car.reverse ? clamp((9 - speed) / 2, 0, 1) : 1)
