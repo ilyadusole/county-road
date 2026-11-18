@@ -166,9 +166,14 @@ export function buildWorld(scene) {
   const copses = Array.from({ length: 140 }, () => [
     (random() - 0.5) * 5600, (random() - 0.5) * 5600, 30 + random() * 110])
   const treeGeometries = [new T.IcosahedronGeometry(1, 0), new T.IcosahedronGeometry(1, 1)]
-  for (const [color, count, spread] of [[0x697f4b, 530, 2400], [0x506843, 300, 2400],
-    [0x5f7746, 1400, 5600], [0x4a6140, 900, 5600]]) {
+  // Each kind of tree turns its own autumn colour.
+  const treeMaterials = []
+  for (const [color, count, spread, autumnColor] of [[0x697f4b, 530, 2400, 0xb5762c], [0x506843, 300, 2400, 0x8c5a2e],
+    [0x5f7746, 1400, 5600, 0xc29038], [0x4a6140, 900, 5600, 0x9a4a24]]) {
     const material = terrainMaterial(color)
+    material.userData.summer = new T.Color(color)
+    material.userData.autumn = new T.Color(autumnColor)
+    treeMaterials.push(material)
     const batches = [[], []]
     for (let i = 0; i < count; i++) {
       let x = (random() - 0.5) * spread
@@ -198,6 +203,17 @@ export function buildWorld(scene) {
       trees.computeBoundingSphere()
       scene.add(trees)
     })
+  }
+  const fresh = new T.Color(0x8fae58)
+  const bareTwigs = new T.Color(0x6b6158)
+  return {
+    /** Leaves for the season (weather.js seasonFor): fresh in spring, autumn colours, bare in winter. */
+    setSeason({ bare, autumn, fresh: spring }) {
+      for (const material of treeMaterials) {
+        const { summer, autumn: turned } = material.userData
+        material.color.copy(summer).lerp(fresh, spring * 0.45).lerp(turned, autumn).lerp(bareTwigs, bare * 0.85)
+      }
+    },
   }
 }
 

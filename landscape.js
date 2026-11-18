@@ -143,6 +143,20 @@ function grassFineTexture() {
   return { tex, mean }
 }
 
+/** Grass for the season (weather.js seasonFor), shared by the ground's shader. */
+export const groundUniforms = {
+  uGrassTint: { value: new T.Vector3(1, 1, 1) },
+  uGrassDry: { value: 0 }, // late summer: the grass yellows
+  uGrassLen: { value: 0 }, // how long it has grown (0-1): coarser blades
+}
+
+/** Set the ground's grass for the season. */
+export function setGroundSeason(season) {
+  groundUniforms.uGrassTint.value.set(...season.grass)
+  groundUniforms.uGrassDry.value = season.dry
+  groundUniforms.uGrassLen.value = season.length
+}
+
 const GLSL = /* glsl */ `
 varying vec3 vGroundWorld;
 float gHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -165,11 +179,12 @@ function addGroundDetail(material) {
   material.onBeforeCompile = shader => {
     shader.uniforms.grassFine = { value: fine.tex }
     shader.uniforms.grassFineMean = { value: fine.mean }
+    Object.assign(shader.uniforms, groundUniforms)
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 vGroundWorld;')
       .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\nvGroundWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;')
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${GLSL}\nuniform sampler2D grassFine;\nuniform float grassFineMean;`)
+      .replace('#include <common>', `#include <common>\n${GLSL}\nuniform sampler2D grassFine;\nuniform float grassFineMean;\nuniform vec3 uGrassTint;\nuniform float uGrassDry;\nuniform float uGrassLen;`)
       .replace('#include <map_fragment>', /* glsl */ `
         vec2 p = vGroundWorld.xz;
         // Grass texture at two scales and angles, blended by a slow noise,
@@ -213,16 +228,29 @@ function addGroundDetail(material) {
         float grassy = smoothstep(0.0, 0.06, g.g - max(g.r, g.b));
         {
           float camD = length(vGroundWorld - cameraPosition);
-          float near = 1.0 - smoothstep(10.0, 90.0, camD);
+          float len = clamp(0.45 + 0.55 * uGrassLen, 0.0, 1.0);
+          float near = 1.0 - smoothstep(10.0, 70.0 + 50.0 * len, camD);
           if (near > 0.0 && grassy > 0.0) {
             vec2 r1 = vec2(p.x * 0.94 - p.y * 0.34, p.x * 0.34 + p.y * 0.94);
             vec3 b1 = texture2D(grassFine, r1 / 0.9).rgb;
             vec3 b2 = texture2D(grassFine, vec2(p.y, -p.x) / 0.37 + 0.31).rgb;
             vec3 blades = mix(b1, b2, 0.4) / grassFineMean;
-            blades = 1.0 + (blades - 1.0) * 0.95;
-            float tuft = 0.92 + 0.16 * gNoise(p / 0.45);
+            // Longer grass: big coarse blades and tufts with shadowed hollows.
+            vec3 b3 = texture2D(grassFine, vec2(p.x * 0.6 + p.y * 0.8, -p.x * 0.8 + p.y * 0.6) / 2.6 + 0.17).rgb / grassFineMean;
+            blades = mix(blades, mix(blades, b3, 0.6), len);
+            blades = 1.0 + (blades - 1.0) * mix(vec3(0.85), vec3(1.25), len);
+            float tuft = mix(0.92 + 0.16 * gNoise(p / 0.45), 0.72 + 0.56 * gNoise(p / 0.8) * gNoise(p / 2.3 + 5.0) * 1.6, len);
             g *= mix(vec3(1.0), blades * tuft, near * grassy);
           }
+        }
+        // The season: on green ground only (hedges, crops and pasture too).
+        g *= mix(vec3(1.0), uGrassTint, grassy);
+        {
+          // Dried out towards straw in a dry late summer, patchily.
+          float lumG = dot(g, vec3(0.3, 0.59, 0.11));
+          vec3 straw = vec3(1.55, 1.3, 0.72) * lumG * 1.45;
+          float patchy = 0.85 + 0.3 * gNoise(p / 9.0);
+          g = mix(g, straw, clamp(uGrassDry * patchy, 0.0, 1.0) * grassy);
         }
         diffuseColor.rgb *= g;
       `)

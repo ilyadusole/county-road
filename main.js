@@ -5,12 +5,16 @@ import { createCar, createStepper, interpolateCarPose, shiftGear, stepCar } from
 import { HALF_WORLD, LANDMARKS, PAD, SPAWN, isPaved, nearestRoad, resolveLandmarks, roads } from './roads.js'
 import { buildCar, buildWorld } from './scenery.js'
 import { createSky } from './sky.js'
+import { createSkySettings, loadSkySettings } from './skySettings.js'
+import { clockHours, dayOfYear, moonAge, seasonFor, weatherFor } from './weather.js'
+import { setGroundSeason } from './landscape.js'
+import { createGlare } from './glare.js'
 
 const select = id => document.getElementById(id)
 const notice = select('notice')
 const view = select('view')
 const scene = new T.Scene()
-const camera = new T.PerspectiveCamera(56, 1, 0.3, 3600)
+const camera = new T.PerspectiveCamera(56, 1, 0.3, 4000)
 const MAX_RENDER_PIXELS = 1920 * 1080
 let renderer
 try {
@@ -39,8 +43,12 @@ window.addEventListener('resize', resize)
 resize()
 
 const sky = createSky(scene)
-setupSkySettings()
-buildWorld(scene)
+const world = buildWorld(scene)
+const glare = createGlare(view)
+const skySettings = loadSkySettings()
+createSkySettings(select('sky-options'), skySettings, applySky)
+applySky()
+let clockTimer = 0
 const model = buildCar(scene)
 const bindings = loadBindings()
 const settings = createSettings(bindings, updateBindingHints)
@@ -211,7 +219,7 @@ renderer.setAnimationLoop(now => {
   settings.update(input.devices)
   if (paused) {
     drivingAudio.update(now, car, input, true)
-    renderer.toneMappingExposure = sky.state.exposure
+    updateSky(delta, true)
     renderer.render(scene, camera)
     return
   }
@@ -233,33 +241,44 @@ renderer.setAnimationLoop(now => {
   renderCar()
   updateCamera(delta)
   updateHud(now)
-  sky.update(delta, camera)
-  renderer.toneMappingExposure = sky.state.exposure
+  updateSky(delta, false)
   renderer.render(scene, camera)
 })
 
-function setupSkySettings() {
-  const KEY = 'county-road-sky'
-  let saved = {}
-  try { saved = JSON.parse(localStorage.getItem(KEY)) ?? {} } catch {}
-  const values = { hours: 15, clouds: 0.35, ...saved }
-  const time = select('time-of-day')
-  const clouds = select('cloud-cover')
-  function apply() {
-    values.hours = Number(time.value)
-    values.clouds = Number(clouds.value)
-    sky.setTime(values.hours)
-    sky.setClouds(values.clouds)
-    const minutes = Math.round(values.hours * 60) % 1440
-    select('time-of-day-value').textContent = `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`
-    select('cloud-cover-value').textContent = `${Math.round(values.clouds * 100)}%`
-    try { localStorage.setItem(KEY, JSON.stringify(values)) } catch {}
+/** Apply the sky and weather settings (skySettings.js) to the world. */
+function applySky() {
+  const o = skySettings
+  const now = new Date()
+  const hours = o.useClock ? clockHours(now) : Number(o.timeOfDay)
+  const day = o.useClock ? dayOfYear(now) : Number(o.dayOfYear)
+  // The moon by the date (this year, at that time of day), or as chosen.
+  const date = new Date(now.getFullYear(), 0, day, Math.floor(hours), (hours % 1) * 60)
+  const age = { new: 0, crescent: 0.15, quarter: 0.25, gibbous: 0.37, full: 0.5 }[o.moonPhase]
+    ?? moonAge(o.useClock ? now : date)
+  sky.setStars(o.stars)
+  sky.setClouds(Number(o.cloudCover), o.cloudType)
+  sky.setTime(hours, day, age)
+  sky.setWind(Number(o.windSpeed), Number(o.windDir))
+  sky.setWeather(weatherFor(o, day, hours))
+  const season = seasonFor(day)
+  setGroundSeason(season)
+  world.setSeason(season)
+}
+
+function updateSky(delta, paused) {
+  // Following the clock: move the sun along every half minute.
+  if (skySettings.useClock && (clockTimer -= delta) <= 0) {
+    clockTimer = 30
+    applySky()
   }
-  time.value = values.hours
-  clouds.value = values.clouds
-  time.addEventListener('input', apply)
-  clouds.addEventListener('input', apply)
-  apply()
+  sky.update(paused ? 0 : delta, camera)
+  const far = Math.min(4000, sky.state.visibleFar)
+  if (Math.abs(camera.far - far) > 1) {
+    camera.far = far
+    camera.updateProjectionMatrix()
+  }
+  glare.update(camera, sky.state, delta, skySettings.sunGlare)
+  renderer.toneMappingExposure = sky.state.exposure
 }
 
 function createDrivingAudio(settingsButton) {

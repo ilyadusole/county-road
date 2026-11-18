@@ -5,12 +5,12 @@
 // lights and horizon haze for the time of day.
 import * as T from 'three'
 import { Sky } from 'three/addons/objects/Sky.js'
+import { FIELD_GLSL, LowCloud, fog4, fogUniforms, installVolumetricFog, moonIllumination } from './weather.js'
 
 const LATITUDE = 52
 const deg = Math.PI / 180
 // Everything in the sky is drawn inside the camera's far plane.
 const DOME = 3200
-export const CLOUD_HEIGHT = 700
 
 /**
  * Sun elevation and azimuth (degrees; azimuth 0 = north, 90 = east) for a
@@ -29,10 +29,13 @@ export function sunPosition(hours, day = 172, latitude = LATITUDE) {
   return { elevation: el / deg, azimuth: az }
 }
 
-/** A full moon: opposite the sun, a little higher, so there is moonlight all night. */
-export function moonPosition(hours, day) {
-  const s = sunPosition((hours + 12) % 24, day)
-  return { elevation: s.elevation + 8, azimuth: s.azimuth }
+/**
+ * The moon for its age (0 new .. 0.5 full): it runs that much of a day
+ * behind the sun, along the sun's path for that much later in the year
+ * (so a full moon rides low in summer and high in winter).
+ */
+export function moonPosition(hours, day, age = 0.5) {
+  return sunPosition((((hours - age * 24) % 24) + 24) % 24, day + age * 365)
 }
 
 const smooth = (e0, e1, x) => {
@@ -85,9 +88,11 @@ function daySky() {
   // The Preetham sky is very bright; scaled down (and its blue deepened)
   // before tone mapping, the blue survives instead of washing out.
   u.skyGain = { value: 0.36 }
+  u.skyFog = { value: 0 }
   u.skyFogColor = { value: new T.Color() }
+  Object.assign(u, fogUniforms())
   sky.material.fragmentShader = sky.material.fragmentShader
-    .replace('void main() {', 'uniform float skyGain;\nuniform vec3 skyFogColor;\nvoid main() {')
+    .replace('void main() {', `uniform float skyGain;\nuniform float skyFog;\nuniform vec3 skyFogColor;\n${FIELD_GLSL}\nvoid main() {`)
     .replace('#include <tonemapping_fragment>', `{
       vec3 c = gl_FragColor.rgb * skyGain;
       float l = dot(c, vec3(0.3, 0.55, 0.15));
@@ -99,8 +104,13 @@ function daySky() {
     .replace('#include <colorspace_fragment>', `#include <colorspace_fragment>
     {
       vec3 sd = normalize(vWorldPosition - cameraPosition);
-      float toHaze = 1.0 - smoothstep(-0.01, 0.16, sd.y);
+      float toHaze = max(skyFog, 1.0 - smoothstep(-0.01, 0.16, sd.y));
       gl_FragColor.rgb = mix(gl_FragColor.rgb, skyFogColor, toHaze);
+      // Mist and low cloud in the way (out to 3 km).
+      if (fogMistA.x > 0.0 || fogMistA.z > 0.0) {
+        vec4 f = vfAlong(cameraPosition, cameraPosition + sd * 3000.0, skyFogColor);
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, f.yzw, 1.0 - exp(-f.x));
+      }
     }`)
   return sky
 }
@@ -171,30 +181,66 @@ function starField() {
   return stars
 }
 
-function moonSprite() {
-  const canvas = document.createElement('canvas')
-  canvas.width = canvas.height = 128
+/** Draw the moon's face for its age (0 new .. 0.5 full), lit from the sun's side. */
+function drawMoon(canvas, age) {
   const g = canvas.getContext('2d')
+  const lit = moonIllumination(age)
+  g.clearRect(0, 0, 128, 128)
+  g.globalCompositeOperation = 'source-over'
   const glow = g.createRadialGradient(64, 64, 18, 64, 64, 64)
-  glow.addColorStop(0, 'rgba(220,230,255,0.35)')
+  glow.addColorStop(0, `rgba(220,230,255,${(0.35 * lit).toFixed(3)})`)
   glow.addColorStop(1, 'rgba(220,230,255,0)')
   g.fillStyle = glow
   g.fillRect(0, 0, 128, 128)
-  g.fillStyle = '#eef0f4'
-  g.beginPath()
-  g.arc(64, 64, 20, 0, Math.PI * 2)
-  g.fill()
-  g.fillStyle = 'rgba(150,155,170,0.5)'
-  for (const [x, y, r] of [[58, 58, 6], [70, 66, 5], [62, 72, 4], [72, 55, 3]]) {
-    g.beginPath()
-    g.arc(x, y, r, 0, Math.PI * 2)
-    g.fill()
+  // The lit part: a half disc on the sun's side (right while waxing, as
+  // seen from the north), widened by a half ellipse when gibbous or cut
+  // down by one when a crescent.
+  const face = document.createElement('canvas')
+  face.width = face.height = 128
+  const m = face.getContext('2d')
+  const r = 20
+  const waxing = age < 0.5
+  m.fillStyle = '#eef0f4'
+  m.beginPath()
+  m.arc(64, 64, r, -Math.PI / 2, Math.PI / 2, !waxing)
+  m.fill()
+  const rx = r * Math.abs(Math.cos(age * 2 * Math.PI))
+  m.globalCompositeOperation = lit > 0.5 ? 'source-over' : 'destination-out'
+  m.beginPath()
+  m.ellipse(64, 64, Math.max(rx, 0.01), r, 0, 0, Math.PI * 2)
+  m.fill()
+  // Darker "seas", on the lit part only.
+  m.globalCompositeOperation = 'source-atop'
+  m.fillStyle = 'rgba(150,155,170,0.5)'
+  for (const [x, y, rr] of [[58, 58, 6], [70, 66, 5], [62, 72, 4], [72, 55, 3]]) {
+    m.beginPath()
+    m.arc(x, y, rr, 0, Math.PI * 2)
+    m.fill()
   }
+  // The dark side, faintly (earthshine).
+  g.fillStyle = 'rgba(40,46,60,0.35)'
+  g.beginPath()
+  g.arc(64, 64, r, 0, Math.PI * 2)
+  g.fill()
+  g.drawImage(face, 0, 0)
+}
+
+function moonSprite() {
+  const canvas = document.createElement('canvas')
+  canvas.width = canvas.height = 128
+  drawMoon(canvas, 0.5)
   const map = new T.CanvasTexture(canvas)
   map.colorSpace = T.SRGBColorSpace
   const moon = new T.Sprite(new T.SpriteMaterial({ map, transparent: true, depthWrite: false, fog: false }))
   moon.scale.setScalar(DOME * 0.106)
   moon.renderOrder = -1
+  moon.userData.age = 0.5
+  moon.userData.setAge = age => {
+    if (Math.abs(age - moon.userData.age) < 0.004) return
+    moon.userData.age = age
+    drawMoon(canvas, age)
+    map.needsUpdate = true
+  }
   return moon
 }
 
@@ -202,12 +248,23 @@ function moonSprite() {
 // Fair-weather cumulus on one big plane, drawn by a noise shader. The same
 // noise dims the sunlight on the ground below, so shadows always match.
 
+/** Cloud types: noise scale and stretch, coverage, edge, opacity, shadow, height (m). */
+export const CLOUD_TYPES = {
+  cumulus: { label: 'Fair-weather cumulus', scale: [700, 700], low: 0.66, high: 0.30, edge: 0.09, alpha: 1, shadow: 1, height: 700, detail: 0.2 },
+  stratocumulus: { label: 'Stratocumulus rolls', scale: [1200, 480], low: 0.5, high: 0.12, edge: 0.16, alpha: 1, shadow: 0.85, height: 620, detail: 0.3 },
+  altocumulus: { label: 'Altocumulus (mackerel sky)', scale: [260, 190], low: 0.62, high: 0.3, edge: 0.07, alpha: 0.85, shadow: 0.45, height: 1300, detail: 0.5 },
+  cirrus: { label: 'High cirrus', scale: [2600, 160], low: 0.62, high: 0.28, edge: 0.3, alpha: 0.55, shadow: 0.15, height: 1700, detail: 0.45 },
+}
+
 /** Shared by the cloud layer and every material that shows cloud shadows. */
 export const cloudUniforms = {
   cloudOffset: { value: new T.Vector2() },
   cloudCover: { value: 0.35 },
   cloudSunDir: { value: new T.Vector3(0, 1, 0) },
   cloudShadowStrength: { value: 0.6 },
+  cloudScale: { value: new T.Vector2(700, 700) },
+  cloudShape: { value: new T.Vector4(0.66, 0.30, 0.09, 0.2) }, // threshold clear, overcast; edge; detail
+  cloudHeight: { value: 700 },
 }
 
 const NOISE = /* glsl */ `
@@ -223,10 +280,13 @@ float cFbm(vec2 p) {
   return s;
 }
 float cloudDensity(vec2 xz) {
-  vec2 p = (xz + cloudOffset) / 700.0;
-  float n = cFbm(p) * 0.8 + cFbm(p * 3.7 + 4.0) * 0.2;
-  float t = mix(0.66, 0.30, cloudCover);
-  return smoothstep(t, t + 0.09, n);
+  // Turned a little off the compass so streaks and rolls don't line up with the roads.
+  vec2 q = xz + cloudOffset;
+  q = vec2(q.x * 0.87 + q.y * 0.5, -q.x * 0.5 + q.y * 0.87);
+  vec2 p = q / cloudScale;
+  float n = cFbm(p) * (1.0 - cloudShape.w) + cFbm(p * 3.7 + 4.0) * cloudShape.w;
+  float t = mix(cloudShape.x, cloudShape.y, cloudCover);
+  return smoothstep(t, t + cloudShape.z, n);
 }
 `
 
@@ -235,6 +295,9 @@ uniform vec2 cloudOffset;
 uniform float cloudCover;
 uniform vec3 cloudSunDir;
 uniform float cloudShadowStrength;
+uniform vec2 cloudScale;
+uniform vec4 cloudShape;
+uniform float cloudHeight;
 `
 
 function cloudLayer() {
@@ -244,6 +307,8 @@ function cloudLayer() {
     shadeColor: { value: new T.Color(0.62, 0.66, 0.72) },
     hazeColor: { value: new T.Color('#c3d5e8') },
     night: { value: 0 },
+    mistFade: { value: 0 },
+    cloudAlpha: { value: 1 },
   }
   const material = new T.ShaderMaterial({
     uniforms,
@@ -256,7 +321,7 @@ function cloudLayer() {
       }`,
     fragmentShader: /* glsl */ `
       ${UNIFORM_DECLS}
-      uniform vec3 lightColor; uniform vec3 shadeColor; uniform vec3 hazeColor; uniform float night;
+      uniform vec3 lightColor; uniform vec3 shadeColor; uniform vec3 hazeColor; uniform float night; uniform float mistFade; uniform float cloudAlpha;
       varying vec3 vWorld;
       ${NOISE}
       void main() {
@@ -267,7 +332,7 @@ function cloudLayer() {
         vec3 c = mix(lightColor, shadeColor, clamp(thick * 0.9, 0.0, 1.0));
         float dist = length(vWorld.xz - cameraPosition.xz);
         c = mix(c, hazeColor, smoothstep(700.0, ${(DOME * 0.95).toFixed(1)}, dist) * 0.85);
-        float a = min(1.0, d * 1.5) * (1.0 - smoothstep(${(DOME * 0.75).toFixed(1)}, ${(DOME * 1.1).toFixed(1)}, dist)) * mix(1.0, 0.8, night);
+        float a = min(1.0, d * 1.5) * (1.0 - smoothstep(${(DOME * 0.75).toFixed(1)}, ${(DOME * 1.1).toFixed(1)}, dist)) * mix(1.0, 0.8, night) * cloudAlpha * (1.0 - mistFade);
         gl_FragColor = vec4(c, a);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -278,7 +343,6 @@ function cloudLayer() {
     fog: false,
   })
   const mesh = new T.Mesh(new T.PlaneGeometry(DOME * 2.6, DOME * 2.6).rotateX(-Math.PI / 2), material)
-  mesh.position.y = CLOUD_HEIGHT
   mesh.renderOrder = -1
   mesh.frustumCulled = false
   return { mesh, uniforms }
@@ -303,7 +367,7 @@ export function addCloudShadows(material) {
         {
           // Follow the sun ray up to the cloud layer.
           float up = max(cloudSunDir.y, 0.08);
-          vec2 at = vCloudWorld.xz + cloudSunDir.xz / up * (${CLOUD_HEIGHT.toFixed(1)} - vCloudWorld.y);
+          vec2 at = vCloudWorld.xz + cloudSunDir.xz / up * (cloudHeight - vCloudWorld.y);
           float shade = 1.0 - cloudShadowStrength * cloudDensity(at);
           reflectedLight.directDiffuse *= shade;
           reflectedLight.directSpecular *= shade;
@@ -317,15 +381,20 @@ export function addCloudShadows(material) {
 
 // --- The whole sky -------------------------------------------------------------
 
+const _mist = new T.Color()
+const _cloudTop = new T.Color()
+const _cloudSun = new T.Color()
+
 /**
- * Build the sky, lights and haze in a scene. Returns setTime(hours, day),
- * setClouds(cover) and update(dt, camera) for every frame.
+ * Build the sky, lights, haze and weather in a scene. Call setOptions with
+ * the settings (sky options), and update(dt, camera) every frame.
  */
-export function createSky(scene, { haze = 0.0006 } = {}) {
+export function createSky(scene, { haze = 0.0006, far = 4000 } = {}) {
+  // Haze, mist and low cloud in every material's fog (weather.js).
+  installVolumetricFog(haze)
   scene.background = new T.Color('#9cc3e6')
   scene.fog = new T.FogExp2('#c3d5e8', haze)
   const sky = daySky()
-  // Night dome, stars and moon follow the camera.
   const night = new T.Group()
   const dome = nightDome()
   const stars = starField()
@@ -338,21 +407,34 @@ export function createSky(scene, { haze = 0.0006 } = {}) {
   const sun = new T.DirectionalLight('#fff3df', 2.6)
   scene.add(hemi, sun, sun.target)
 
+  const lowCloud = new LowCloud()
   const sunDir = new T.Vector3()
   const moonDir = new T.Vector3()
   const lightDir = new T.Vector3()
   const hazeBase = new T.Color()
-  const wind = new T.Vector2(2.5, 1.2) // m/s at ground level; clouds drift faster aloft
-  const state = { exposure: 0.9, night: 0, hours: 15, day: 172 }
+  const wind = new T.Vector2()
+  // What the rest of the game reads: the sun, how foggy it is around the
+  // camera, how far anything can be seen, the exposure to use.
+  const state = {
+    exposure: 0.9, night: 0, sunDir, sunElevation: 30, fogNow: 0, visibleFar: far,
+    weather: { mist: 0, mistTop: 45, lowCloud: { amount: 0, base: 60, top: 100 } },
+    starLevel: 1, cloudShadow: 1,
+  }
+  let sunBase = sun.intensity
+  let hemiBase = hemi.intensity
 
-  function setTime(hours, day = state.day) {
-    state.hours = hours
-    state.day = day
+  /**
+   * Time and date: sun, moon, sky, light colours, haze and stars.
+   * moonAgeNow: the moon's age (0 new .. 0.5 full).
+   */
+  function setTime(hours, day, moonAgeNow = 0.5) {
     const s = sunPosition(hours, day)
-    const m = moonPosition(hours, day)
+    const m = moonPosition(hours, day, moonAgeNow)
+    const lit = moonIllumination(moonAgeNow)
     skyDir(s.elevation, s.azimuth, sunDir)
     skyDir(m.elevation, m.azimuth, moonDir)
     const el = s.elevation
+    state.sunElevation = el
     sky.material.uniforms.sunPosition.value.copy(sunDir)
     const dark = smooth(2, -10, el)
     state.night = dark
@@ -367,34 +449,38 @@ export function createSky(scene, { haze = 0.0006 } = {}) {
     } else {
       lightDir.copy(moonDir)
       lightDir.y = Math.max(lightDir.y, 0.05)
-      sun.intensity = 0.32 * moonUp * dark
+      sun.intensity = 0.32 * moonUp * dark * lit
       sun.color.setRGB(0.62, 0.72, 1)
     }
     lightDir.normalize()
-    // Sky light: blue by day, deep blue at night (never quite black).
-    hemi.intensity = 0.12 + 1.0 * daylight + 0.08 * (1 - dark)
+    // Sky light: blue by day, deep blue at night (a little more under a
+    // bright moon, never quite black).
+    const moonGlow = moonUp * lit * dark
+    hemi.intensity = 0.1 + 1.0 * daylight + 0.08 * (1 - dark) + 0.06 * moonGlow
     hemi.color.setRGB(0.81 - 0.45 * dark, 0.89 - 0.42 * dark, 1 - 0.3 * dark)
     hemi.groundColor.setRGB(0.3 * (1 - dark) + 0.03, 0.35 * (1 - dark) + 0.04, 0.2 * (1 - dark) + 0.06)
     hazeColour(el, hazeBase)
     scene.fog.color.copy(hazeBase)
     scene.background.copy(hazeBase)
-    sky.material.uniforms.skyFogColor.value.copy(hazeBase).convertLinearToSRGB()
-    // Twilight: deep blue overhead, a warm band where the sun went down.
+    sunBase = sun.intensity
+    hemiBase = hemi.intensity
     const u = dome.material.uniforms
     u.opacity.value = smooth(3, -3, el)
     u.zenith.value.copy(TWILIGHT_ZENITH).lerp(NIGHT_ZENITH, smooth(-2, -12, el))
     u.horizon.value.copy(TWILIGHT_HORIZON).lerp(NIGHT_HORIZON, smooth(0, -9, el))
     u.glow.value.copy(TWILIGHT_GLOW).multiplyScalar(1 - smooth(-4, -14, el))
     u.sunDir.value.copy(sunDir)
-    stars.material.opacity = dark
-    moon.visible = m.elevation > -2
-    moon.material.opacity = 0.25 + 0.75 * smooth(0, -8, el)
+    // Stars fade in as it gets dark (and under a bright moon a little).
+    stars.material.opacity = dark * state.starLevel * (1 - 0.3 * moonGlow)
+    stars.visible = stars.material.opacity > 0.01
+    moon.userData.setAge(moonAgeNow)
+    moon.visible = m.elevation > -2 && lit > 0.02
+    moon.userData.opacity = 0.25 + 0.75 * smooth(0, -8, el)
+    moon.material.opacity = moon.userData.opacity
     moon.position.copy(moonDir).multiplyScalar(DOME * 0.9)
-    // Eyes adapt a little at night.
     state.exposure = 0.9 + 0.5 * dark
-    // Clouds: lit by the light of the moment; their shadows follow the sun.
     cloudUniforms.cloudSunDir.value.copy(lightDir)
-    cloudUniforms.cloudShadowStrength.value = 0.75 * daylight + 0.2 * dark
+    cloudUniforms.cloudShadowStrength.value = (0.75 * daylight + 0.2 * dark * lit) * state.cloudShadow
     const cu = clouds.uniforms
     const k = Math.min(1, sun.intensity / 2.2)
     const dim = 1 - 0.85 * dark
@@ -404,23 +490,111 @@ export function createSky(scene, { haze = 0.0006 } = {}) {
     cu.night.value = dark
   }
 
-  function setClouds(cover) {
+  /** Cloud cover (0-1) and type (a key of CLOUD_TYPES). */
+  function setClouds(cover, type = 'cumulus') {
+    const t = CLOUD_TYPES[type] ?? CLOUD_TYPES.cumulus
     cloudUniforms.cloudCover.value = cover
+    cloudUniforms.cloudScale.value.set(...t.scale)
+    cloudUniforms.cloudShape.value.set(t.low, t.high, t.edge, t.detail)
+    cloudUniforms.cloudHeight.value = t.height
+    clouds.mesh.position.y = t.height
+    clouds.uniforms.cloudAlpha.value = t.alpha
+    state.cloudShadow = t.shadow
+    state.cloudDim = 0.95 * t.shadow // how much it can hide the sun (glare)
     clouds.mesh.visible = cover > 0.01
   }
 
-  function update(dt, camera) {
-    const o = cloudUniforms.cloudOffset.value
-    o.x -= wind.x * 1.8 * dt
-    o.y -= wind.y * 1.8 * dt
-    night.position.copy(camera.position)
-    clouds.mesh.position.x = camera.position.x
-    clouds.mesh.position.z = camera.position.z
-    // Keep the sun's light aimed from the right direction wherever the car is.
-    sun.target.position.copy(camera.position)
-    sun.position.copy(camera.position).addScaledVector(lightDir, 100)
+  /** Mist (0-1) and low cloud ({ amount, base, top }): weather.js weatherFor. */
+  function setWeather(w) {
+    state.weather = w
+    lowCloud.set(w.lowCloud.amount, w.lowCloud.base, w.lowCloud.top)
   }
 
-  setTime(state.hours, state.day)
-  return { setTime, setClouds, update, state, hemi, sun }
+  /** Wind (m/s) and the compass direction it blows from (degrees). */
+  function setWind(speed, fromDeg) {
+    const a = fromDeg * deg
+    // Blowing from the north (azimuth 0, -z) moves things towards +z.
+    wind.set(-Math.sin(a) * speed, Math.cos(a) * speed)
+  }
+
+  /** Stars: 'dark' (dark countryside), 'town' (fewer, town glow) or 'off'. */
+  function setStars(mode) {
+    state.starLevel = mode === 'off' ? 0 : mode === 'town' ? 0.4 : 1
+  }
+
+  /**
+   * Every frame: drift the clouds; mist and low cloud where the camera is
+   * (the haze thickens and greys, the sky and high clouds fade into it,
+   * the sun dims; inside a cloud you see a few tens of metres).
+   */
+  function update(dt, camera, groundY = 0) {
+    const o = cloudUniforms.cloudOffset.value
+    const aloft = CLOUD_TYPES.cirrus.height === cloudUniforms.cloudHeight.value ? 3.5 : 1.8
+    o.x -= wind.x * aloft * dt
+    o.y -= wind.y * aloft * dt
+    const camPos = camera.position
+    night.position.copy(camPos)
+    clouds.mesh.position.x = camPos.x
+    clouds.mesh.position.z = camPos.z
+    sun.target.position.copy(camPos)
+    sun.position.copy(camPos).addScaledVector(lightDir, 100)
+
+    lowCloud.update(dt, wind)
+    const w = state.weather
+    const mist = w.mist
+    const fog = scene.fog
+    const el = state.sunElevation
+    const day = smooth(-6, 14, el)
+    const mistD = mist > 0 ? 3 / (650 - 560 * Math.pow(mist, 0.7)) : 0
+    const top = w.mistTop ?? 45
+    Object.assign(fog4.a, { x: mistD, y: top, z: lowCloud.amount, w: 3 / 35 })
+    Object.assign(fog4.b, { x: lowCloud.base, y: lowCloud.top, z: lowCloud.offset.x, w: lowCloud.offset.y })
+    Object.assign(fog4.sun, { x: sunDir.x, y: sunDir.y, z: sunDir.z, w: 0.25 * smooth(-2, 10, el) })
+    const inCloud = lowCloud.inside(camPos)
+    const H = Math.max(top * 0.3, 4)
+    const overhead = mistD * (Math.max(0, top - camPos.y) + H * Math.exp(-Math.max(0, camPos.y - top) / H))
+    const veil = 1 - Math.exp(-overhead * 1.2)
+    // How far anything can be seen: no need to draw beyond solid fog.
+    const inMist = mistD > 0 ? 1 - smooth(groundY + top, groundY + top * 2 + 20, camPos.y) : 0
+    let visible = far
+    if (inMist > 0) visible = Math.min(visible, 6 / (0.7 * mistD) / Math.max(inMist, 1e-3))
+    if (inCloud > 0.3) visible = Math.min(visible, 350 / inCloud)
+    state.visibleFar = Math.max(250, visible)
+    const grey = Math.max(veil, inCloud)
+    state.fogNow = grey
+    // The haze greys with mist: its own colour of the moment, so it
+    // darkens through dusk with the sky.
+    const h = hazeBase
+    const lum = 0.3 * h.r + 0.55 * h.g + 0.15 * h.b
+    _mist.setRGB(lum, lum * 1.02, lum * 1.06).lerp(h, 0.35).multiplyScalar(0.92)
+    fog.color.copy(h).lerp(_mist, Math.min(1, mist * 1.2))
+    // Low cloud: underneath the same grey as the mist (a shade darker), on
+    // top brighter in the sun.
+    _mist.setRGB(lum, lum * 1.02, lum * 1.06).lerp(h, 0.35).multiplyScalar(0.88)
+    _cloudTop.copy(_mist)
+    _mist.convertLinearToSRGB()
+    Object.assign(fog4.under, { x: _mist.r, y: _mist.g, z: _mist.b })
+    _cloudTop.lerp(_cloudSun.copy(sun.color).multiplyScalar(0.95), 0.6 * day).convertLinearToSRGB()
+    Object.assign(fog4.top, { x: _cloudTop.r, y: _cloudTop.g, z: _cloudTop.b })
+    scene.background.copy(fog.color)
+    const su = sky.material.uniforms
+    su.skyFog.value = 0
+    su.skyFogColor.value.copy(fog.color).convertLinearToSRGB()
+    // Under low cloud the high clouds and stars are hidden too.
+    const ceiling = camPos.y < lowCloud.base ? smooth(0.5, 0.9, lowCloud.amount) : 0
+    clouds.uniforms.mistFade.value = Math.min(1, Math.max(grey * 1.3, ceiling))
+    const hidden = Math.min(1, Math.max(grey * 1.3, ceiling))
+    stars.material.opacity = state.night * state.starLevel * (1 - hidden)
+    moon.material.opacity = (moon.userData.opacity ?? 1) * (1 - hidden)
+    const overcast = camPos.y < lowCloud.base ? lowCloud.amount * 0.6 : 0
+    const dim = 1 - Math.max(veil * 0.75, overcast, inCloud * 0.8)
+    sun.intensity = sunBase * dim
+    hemi.intensity = hemiBase * (1 + 0.15 * grey)
+    state.lowCloudCover = overcast
+  }
+
+  setWind(3, 270)
+  setTime(15, 172)
+  setClouds(0.35)
+  return { setTime, setClouds, setWeather, setWind, setStars, update, state, hemi, sun }
 }
