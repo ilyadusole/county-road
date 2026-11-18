@@ -9,9 +9,10 @@ export const LANDMARKS = [
   { x: 294, z: -103, halfX: 2.7, halfZ: 2.7 },
 ]
 const CELL = 20
+const GRID_STRIDE = 2 * Math.ceil(HALF_WORLD / CELL) + 1
 const grid = new Map()
 const segments = []
-const key = (x, z) => `${x},${z}`
+const key = (x, z) => x * GRID_STRIDE + z
 
 export const roads = [
   [[0, -360], [0, 360]],
@@ -52,12 +53,15 @@ function project(x, z, { a, dx, dz, lengthSquared }) {
 
 export function isPaved(x, z) {
   if ((x - PAD.x) ** 2 + (z - PAD.z) ** 2 <= PAD.radius ** 2) return true
+  if (Math.abs(x) > HALF_WORLD || Math.abs(z) > HALF_WORLD) return false
   const nearby = grid.get(key(Math.floor(x / CELL), Math.floor(z / CELL)))
-  return nearby?.some(segment => {
+  if (!nearby) return false
+  for (const segment of nearby) {
     const t = project(x, z, segment)
-    return (x - segment.a.x - t * segment.dx) ** 2
-      + (z - segment.a.z - t * segment.dz) ** 2 <= ROAD_HALF ** 2
-  }) ?? false
+    if ((x - segment.a.x - t * segment.dx) ** 2
+      + (z - segment.a.z - t * segment.dz) ** 2 <= ROAD_HALF ** 2) return true
+  }
+  return false
 }
 
 export function nearestRoad(x, z, heading) {

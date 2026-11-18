@@ -1,7 +1,7 @@
 import * as T from 'three'
 import { createControls, deviceKey, loadBindings } from './controls.js'
 import { createSettings, keyLabel } from './settings.js'
-import { createCar, createStepper, stepCar } from './vehicle.js'
+import { createCar, createStepper, interpolateCarPose, stepCar } from './vehicle.js'
 import { HALF_WORLD, LANDMARKS, PAD, SPAWN, isPaved, nearestRoad, resolveLandmarks, roads } from './roads.js'
 import { buildCar, buildWorld } from './scenery.js'
 
@@ -10,6 +10,7 @@ const notice = select('notice')
 const view = select('view')
 const scene = new T.Scene()
 const camera = new T.PerspectiveCamera(56, 1, 0.15, 2100)
+const MAX_RENDER_PIXELS = 1920 * 1080
 let renderer
 try {
   renderer = new T.WebGLRenderer({ antialias: true })
@@ -18,27 +19,27 @@ try {
   notice.hidden = false
   throw error
 }
-renderer.setPixelRatio(Math.min(devicePixelRatio, 1.6))
-renderer.shadowMap.enabled = true
-renderer.shadowMap.type = T.PCFShadowMap
 renderer.toneMapping = T.ACESFilmicToneMapping
 view.append(renderer.domElement)
 
 function resize() {
   const { clientWidth, clientHeight } = view
-  renderer.setSize(clientWidth, clientHeight, false)
-  camera.aspect = clientWidth / Math.max(1, clientHeight)
+  if (!clientWidth || !clientHeight) return
+  const pixelRatio = Math.min(devicePixelRatio, 1.25, Math.sqrt(MAX_RENDER_PIXELS / (clientWidth * clientHeight)))
+  renderer.setDrawingBufferSize(clientWidth, clientHeight, pixelRatio)
+  camera.aspect = clientWidth / clientHeight
   camera.updateProjectionMatrix()
 }
 window.addEventListener('resize', resize)
 resize()
 
-const sun = buildWorld(scene)
+buildWorld(scene)
 const model = buildCar(scene)
 const bindings = loadBindings()
 const settings = createSettings(bindings, updateBindingHints)
 const controls = createControls(bindings, settings.isOpen)
 const controllerStatus = select('controller')
+const standardBindings = select('standard-bindings')
 const speed = select('speed')
 const gear = select('gear')
 const rpm = select('rpm')
@@ -72,13 +73,16 @@ for (const { x, z, radius = 2.6 } of [...LANDMARKS, { ...PAD, radius: PAD.radius
 }
 
 let car = createCar(SPAWN)
+const previousCar = { ...car }
+const pose = {}
 let input = controls()
 let cameraYaw
 let noticeUntil = 0
 let lastControllerStatus
-const cameraPosition = new T.Vector3()
+let lastHudAt = -Infinity
+let lastRpmPercent
+let lastMapX, lastMapZ, lastMapHeading
 const focus = new T.Vector3()
-const nextFocus = new T.Vector3()
 updateBindingHints()
 
 function updateBindingHints() {
@@ -94,61 +98,68 @@ function announce(message) {
 
 function recover(message) {
   car = createCar(nearestRoad(car.x, car.z, car.heading))
+  Object.assign(previousCar, car)
   cameraYaw = undefined
   announce(message)
 }
 
 const advance = createStepper(() => {
-  const { x, z } = car
+  Object.assign(previousCar, car)
   stepCar(car, input, isPaved)
-  resolveLandmarks(car, x, z)
+  resolveLandmarks(car, previousCar.x, previousCar.z)
   if (Math.max(Math.abs(car.x), Math.abs(car.z)) > HALF_WORLD) recover('Map edge · returned to the nearest road')
 })
 
-function renderCar(delta) {
-  model.root.position.set(car.x, 0.024, car.z)
-  model.root.rotation.y = car.heading
-  model.body.rotation.x = -car.ax * 0.0055
-  model.body.rotation.z = -car.ay * 0.006
+function renderCar() {
+  model.root.position.set(pose.x, 0.024, pose.z)
+  model.root.rotation.y = pose.heading
+  model.body.rotation.x = -pose.ax * 0.0055
+  model.body.rotation.z = -pose.ay * 0.006
   model.brakeMaterial.emissiveIntensity = 0.55 + 2.4 * input.brake
   for (const { pivot, spin, front } of model.wheels) {
-    if (front) pivot.rotation.y = -car.steer
-    spin.rotation.x += car.u / 0.33 * delta
+    if (front) pivot.rotation.y = -pose.steer
+    spin.rotation.x = pose.wheelAngle
   }
 }
 
 function updateCamera(delta) {
-  const desiredYaw = car.heading - input.lookX * Math.PI * 0.9
-  const snap = cameraYaw === undefined
+  const desiredYaw = pose.heading - input.lookX * Math.PI * 0.9
   cameraYaw ??= desiredYaw
   const difference = desiredYaw - cameraYaw
   cameraYaw += Math.atan2(Math.sin(difference), Math.cos(difference)) * (1 - Math.exp(-8 * delta))
   const sin = Math.sin(cameraYaw)
   const cos = Math.cos(cameraYaw)
-  const distance = 7.2 + Math.min(1.8, Math.abs(car.u) * 0.035)
-  cameraPosition.set(car.x - sin * distance, 3.26 + input.lookY * 1.3, car.z - cos * distance)
-  nextFocus.set(car.x + sin * 2.3, 0.88, car.z + cos * 2.3)
-  const blend = snap ? 1 : 1 - Math.exp(-13 * delta)
-  camera.position.lerp(cameraPosition, blend)
-  focus.lerp(nextFocus, blend)
+  const distance = 7.2 + Math.min(1.8, Math.abs(pose.u) * 0.035)
+  camera.position.set(pose.x - sin * distance, 3.26 + input.lookY * 1.3, pose.z - cos * distance)
+  focus.set(pose.x + sin * 2.3, 0.88, pose.z + cos * 2.3)
   camera.lookAt(focus)
-  sun.position.set(car.x - 29, 43, car.z - 18)
-  sun.target.position.set(car.x, 0, car.z)
 }
 
 function updateHud(now) {
-  speed.textContent = String(Math.round(Math.hypot(car.u, car.v) * 3.6))
-  gear.textContent = car.reverse ? 'R' : String(car.gear)
-  rpm.style.transform = `scaleX(${car.rpm / 6900})`
+  if (!notice.hidden && now >= noticeUntil) notice.hidden = true
+  if (now - lastHudAt < 50) return
+  lastHudAt = now
+  const speedLabel = String(Math.round(Math.hypot(car.u, car.v) * 3.6))
+  const gearLabel = car.reverse ? 'R' : String(car.gear)
+  const rpmPercent = Math.round(car.rpm / 69)
+  if (speed.textContent !== speedLabel) speed.textContent = speedLabel
+  if (gear.textContent !== gearLabel) gear.textContent = gearLabel
+  if (rpmPercent !== lastRpmPercent) {
+    rpm.style.transform = `scaleX(${rpmPercent / 100})`
+    lastRpmPercent = rpmPercent
+  }
   const custom = input.devices.some(device => device.mapping !== 'standard' || bindings.devices[deviceKey(device)])
   const status = custom ? 'Controller / wheel · see Settings for bindings'
     : input.connected ? 'Controller connected' : 'Press a button on your controller'
   if (lastControllerStatus !== status) {
     controllerStatus.textContent = status
-    select('standard-bindings').hidden = custom
+    standardBindings.hidden = custom
     lastControllerStatus = status
   }
-  if (now >= noticeUntil) notice.hidden = true
+  if (car.x === lastMapX && car.z === lastMapZ && car.heading === lastMapHeading) return
+  lastMapX = car.x
+  lastMapZ = car.z
+  lastMapHeading = car.heading
   mapContext.clearRect(0, 0, map.width, map.height)
   mapContext.drawImage(staticMap, 0, 0)
   mapContext.save()
@@ -185,8 +196,9 @@ renderer.setAnimationLoop(now => {
       announce('Stop before changing direction')
     }
   }
-  advance(delta)
-  renderCar(delta)
+  const fraction = advance(delta)
+  interpolateCarPose(previousCar, car, fraction, pose)
+  renderCar()
   updateCamera(delta)
   updateHud(now)
   renderer.render(scene, camera)

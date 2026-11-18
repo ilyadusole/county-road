@@ -17,7 +17,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 export function createCar({ x = 0, z = 0, heading = 0 } = {}) {
   return {
     x, z, heading, u: 0, v: 0, yaw: 0, steer: 0, gear: 1, reverse: false,
-    rpm: 850, ax: 0, ay: 0, shiftDelay: 0, slip: 0,
+    rpm: 850, ax: 0, ay: 0, shiftDelay: 0, slip: 0, wheelAngle: 0,
   }
 }
 
@@ -31,6 +31,8 @@ export function stepCar(car, input, isPaved) {
   const desiredSteer = input.steer * steerLimit * keyboardRange
   const steerRate = input.keyboardSteering ? 1.45 : 3.2
   car.steer += clamp(desiredSteer - car.steer, -steerRate * STEP, steerRate * STEP)
+  const steerCos = Math.cos(car.steer)
+  const steerSin = Math.sin(car.steer)
 
   const wheelRpm = Math.abs(u) * 60 / (2 * Math.PI * WHEEL_RADIUS)
   car.shiftDelay = Math.max(0, car.shiftDelay - STEP)
@@ -70,9 +72,8 @@ export function stepCar(car, input, isPaved) {
     const paved = isPaved(wheelX, wheelZ)
     const load = Math.max(400, (front ? frontLoad - pitch : MASS * GRAVITY - frontLoad + pitch) / 2
       - roll * side * (front ? 0.53 : 0.47))
-    const angle = front ? car.steer : 0
-    const c = Math.cos(angle)
-    const s = Math.sin(angle)
+    const c = front ? steerCos : 1
+    const s = front ? steerSin : 0
     const wheelForward = u - yaw * rightOffset
     const wheelRight = v + yaw * forwardOffset
     const longitudinal = wheelForward * c + wheelRight * s
@@ -96,6 +97,7 @@ export function stepCar(car, input, isPaved) {
   car.v += (rightForce / MASS - yaw * u) * STEP
   car.yaw += moment / INERTIA * STEP
   if (speed < 0.12 && input.throttle < 0.015) car.u = car.v = car.yaw = 0
+  car.wheelAngle += (u + car.u) * 0.5 * STEP / WHEEL_RADIUS
   car.heading -= car.yaw * STEP
   car.x += (Math.sin(car.heading) * car.u - Math.cos(car.heading) * car.v) * STEP
   car.z += (Math.cos(car.heading) * car.u + Math.sin(car.heading) * car.v) * STEP
@@ -109,5 +111,15 @@ export function createStepper(update) {
       update()
       accumulator = Math.max(0, accumulator - STEP)
     }
+    return accumulator / STEP
   }
+}
+
+const PRESENTATION_FIELDS = ['x', 'z', 'heading', 'u', 'steer', 'ax', 'ay', 'wheelAngle']
+
+export function interpolateCarPose(previous, current, fraction, output) {
+  for (const field of PRESENTATION_FIELDS) {
+    output[field] = previous[field] + (current[field] - previous[field]) * fraction
+  }
+  return output
 }

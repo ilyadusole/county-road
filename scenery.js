@@ -1,7 +1,9 @@
 import * as T from 'three'
-import { HALF_WORLD, LANDMARKS, PAD, ROAD_HALF, roads, isPaved } from './roads.js'
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
+import { HALF_WORLD, LANDMARKS, PAD, ROAD_HALF, roads } from './roads.js'
 
 const matte = color => new T.MeshStandardMaterial({ color, roughness: 0.83 })
+const terrainMaterial = color => new T.MeshLambertMaterial({ color })
 let seed = 7392
 function random() {
   seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
@@ -22,15 +24,37 @@ function texture(rgb, variance) {
   const map = new T.CanvasTexture(canvas)
   map.colorSpace = T.SRGBColorSpace
   map.wrapS = map.wrapT = T.RepeatWrapping
-  map.anisotropy = 8
+  map.anisotropy = 4
   return map
+}
+
+const shadowGeometry = new T.PlaneGeometry().rotateX(-Math.PI / 2)
+let shadowTexture
+function addContactShadow(parent, width, length, opacity, x = 0, z = 0) {
+  if (!shadowTexture) {
+    const canvas = document.createElement('canvas')
+    canvas.width = canvas.height = 64
+    const context = canvas.getContext('2d')
+    const gradient = context.createRadialGradient(32, 32, 0, 32, 32, 31)
+    gradient.addColorStop(0.35, '#fff')
+    gradient.addColorStop(0.7, '#c0c0c0')
+    gradient.addColorStop(1, '#000')
+    context.fillStyle = gradient
+    context.fillRect(0, 0, 64, 64)
+    shadowTexture = new T.CanvasTexture(canvas)
+  }
+  const material = new T.MeshBasicMaterial({
+    color: 0x111812, alphaMap: shadowTexture, opacity, transparent: true, depthWrite: false,
+  })
+  const mesh = new T.Mesh(shadowGeometry, material)
+  mesh.scale.set(width, 1, length)
+  mesh.position.set(x, 0.032, z)
+  parent.add(mesh)
 }
 
 function box(parent, material, sx, sy, sz, x, y, z) {
   const mesh = new T.Mesh(new T.BoxGeometry(sx, sy, sz), material)
   mesh.position.set(x, y, z)
-  mesh.castShadow = true
-  mesh.receiveShadow = true
   parent.add(mesh)
   return mesh
 }
@@ -70,7 +94,6 @@ function disk(radius, x, z, material, height) {
   const uv = mesh.geometry.attributes.uv
   for (let i = 0; i < p.count; i++) uv.setXY(i, (p.getX(i) + x) / 12, (p.getZ(i) + z) / 12)
   mesh.position.set(x, height, z)
-  mesh.receiveShadow = true
   return mesh
 }
 
@@ -79,20 +102,15 @@ export function buildWorld(scene) {
   scene.fog = new T.FogExp2(0xb6cdd2, 0.00145)
   scene.add(new T.HemisphereLight(0xe4f2ff, 0x8c9161, 2.05))
   const sun = new T.DirectionalLight(0xffedcc, 2.3)
-  sun.castShadow = true
-  sun.shadow.mapSize.set(1536, 1536)
-  Object.assign(sun.shadow.camera, { left: -26, right: 26, top: 26, bottom: -26, near: 0.5, far: 135 })
-  sun.shadow.normalBias = 0.035
-  sun.shadow.bias = -0.00025
-  scene.add(sun, sun.target)
+  sun.position.set(-29, 43, -18)
+  scene.add(sun)
 
-  const grass = new T.MeshStandardMaterial({ map: texture([91, 109, 68], 35), roughness: 1 })
-  const asphalt = new T.MeshStandardMaterial({ map: texture([54, 58, 57], 18), roughness: 0.95 })
-  const shoulder = matte(0x9c9675)
+  const grass = new T.MeshLambertMaterial({ map: texture([91, 109, 68], 35) })
+  const asphalt = new T.MeshLambertMaterial({ map: texture([54, 58, 57], 18) })
+  const shoulder = terrainMaterial(0x9c9675)
   const ground = new T.Mesh(new T.PlaneGeometry(3600, 3600), grass)
   ground.rotation.x = -Math.PI / 2
   ground.material.map.repeat.set(300, 300)
-  ground.receiveShadow = true
   scene.add(ground)
   const joints = [[0, -360], [0, 360], [-428, 0], [0, 28], [320, 0], [0, -238]]
   const paint = new T.MeshBasicMaterial({ color: 0xe0dac1 })
@@ -102,7 +120,6 @@ export function buildWorld(scene) {
   for (const points of roads) {
     for (const [width, height, material] of [[5.42, 0.008, shoulder], [ROAD_HALF, 0.016, asphalt]]) {
       const mesh = new T.Mesh(ribbon(points, width, height), material)
-      mesh.receiveShadow = true
       scene.add(mesh)
     }
     if (points === roads.at(-1)) continue
@@ -131,6 +148,7 @@ export function buildWorld(scene) {
   const barn = new T.Group()
   barn.position.set(LANDMARKS[0].x, 0, LANDMARKS[0].z)
   scene.add(barn)
+  addContactShadow(barn, 25, 20, 0.4, 3, 2)
   box(barn, matte(0x8c4432), 16, 5, 12, 0, 2.5, 0)
   box(barn, matte(0x3b312c), 4.5, 3.6, 0.14, 0, 1.8, 6.02)
   const roof = matte(0x555e5d)
@@ -142,25 +160,25 @@ export function buildWorld(scene) {
   const tower = new T.Group()
   tower.position.set(LANDMARKS[1].x, 0, LANDMARKS[1].z)
   scene.add(tower)
+  addContactShadow(tower, 11, 10, 0.3, 3, 2)
   const steel = matte(0x777b70)
   for (const x of [-2.5, 2.5]) for (const z of [-2.5, 2.5]) box(tower, steel, 0.32, 18, 0.32, x, 9, z)
   const tank = new T.Mesh(new T.CylinderGeometry(3.8, 3.15, 5.5, 16), matte(0xc2c2a5))
   tank.position.y = 19.2
-  tank.castShadow = true
   tower.add(tank)
   const lid = new T.Mesh(new T.ConeGeometry(3.95, 1.45, 16), steel)
   lid.position.y = 22.65
   tower.add(lid)
 
-  for (const [geometry, material, count] of [
-    [new T.IcosahedronGeometry(1, 1), matte(0x697f4b), 530],
-    [new T.IcosahedronGeometry(1, 1), matte(0x506843), 300],
-  ]) {
-    const trees = new T.InstancedMesh(geometry, material, count)
+  const treeGeometries = [new T.IcosahedronGeometry(1, 0), new T.IcosahedronGeometry(1, 1)]
+  for (const [color, count] of [[0x697f4b, 530], [0x506843, 300]]) {
+    const material = terrainMaterial(color)
+    const batches = [[], []]
     for (let i = 0; i < count; i++) {
       const x = (random() - 0.5) * 2400
       const z = (random() - 0.5) * 2400
-      if (Math.max(Math.abs(x), Math.abs(z)) < HALF_WORLD + 14 || isPaved(x, z)) {
+      const distance = Math.max(Math.abs(x), Math.abs(z))
+      if (distance < HALF_WORLD + 14) {
         i--
         continue
       }
@@ -169,11 +187,14 @@ export function buildWorld(scene) {
       transforms.scale.set(scale * 0.86, scale * 1.38, scale * 0.82)
       transforms.rotation.y = random() * Math.PI
       transforms.updateMatrix()
-      trees.setMatrixAt(i, transforms.matrix)
+      batches[Number(distance < HALF_WORLD + 150)].push(transforms.matrix.clone())
     }
-    scene.add(trees)
+    batches.forEach((matrices, i) => {
+      const trees = new T.InstancedMesh(treeGeometries[i], material, matrices.length)
+      matrices.forEach((matrix, index) => trees.setMatrixAt(index, matrix))
+      scene.add(trees)
+    })
   }
-  return sun
 }
 
 function shell(parent, material, sections) {
@@ -194,7 +215,6 @@ function shell(parent, material, sections) {
   geometry.setIndex(indices)
   geometry.computeVertexNormals()
   const mesh = new T.Mesh(geometry, material)
-  mesh.castShadow = true
   parent.add(mesh)
 }
 
@@ -203,6 +223,7 @@ export function buildCar(scene) {
   const body = new T.Group()
   root.add(body)
   scene.add(root)
+  addContactShadow(root, 4, 6.6, 0.74, -0.24, 0.12)
   const red = new T.MeshStandardMaterial({ color: 0xc54e31, metalness: 0.32, roughness: 0.32 })
   const glass = new T.MeshStandardMaterial({ color: 0x203337, metalness: 0.38, roughness: 0.18 })
   const trim = matte(0x242729)
@@ -218,23 +239,25 @@ export function buildCar(scene) {
   const brakeMaterial = new T.MeshStandardMaterial({ color: 0xff3e2c, emissive: 0xe71908, emissiveIntensity: 0.6 })
   const lamps = new T.MeshStandardMaterial({ color: 0xe7f6ff, emissive: 0xc2e3ff, emissiveIntensity: 0.6 })
   const wheels = []
+  const wheelParts = [[0.33, 0.26, tire], [0.215, 0.28, alloy]].map(([radius, width, material]) => ({
+    geometry: new T.CylinderGeometry(radius, radius, width, 24).rotateZ(Math.PI / 2), material,
+  }))
   for (const side of [-1, 1]) {
     box(body, brakeMaterial, 0.46, 0.09, 0.045, side * 0.53, 0.56, -2.13)
     box(body, lamps, 0.43, 0.075, 0.045, side * 0.54, 0.46, 2.15)
     box(body, trim, 0.23, 0.09, 0.19, side * 0.9, 0.88, 0.65)
+    const spokes = Array.from({ length: 5 }, (_, index) => {
+      const angle = index * Math.PI * 0.4
+      return new T.BoxGeometry(0.019, 0.07, 0.125).rotateX(-angle)
+        .translate(side * 0.148, Math.sin(angle) * 0.115, Math.cos(angle) * 0.115)
+    })
+    const rimFace = mergeGeometries(spokes)
+    for (const geometry of spokes) geometry.dispose()
     for (const z of [-1.39, 1.23]) {
       const pivot = new T.Group()
       const spin = new T.Group()
-      for (const [radius, width, material] of [[0.33, 0.26, tire], [0.215, 0.28, alloy]]) {
-        const mesh = new T.Mesh(new T.CylinderGeometry(radius, radius, width, 24).rotateZ(Math.PI / 2), material)
-        mesh.castShadow = true
-        spin.add(mesh)
-      }
-      for (let i = 0; i < 5; i++) {
-        const spoke = box(spin, trim, 0.019, 0.07, 0.125, side * 0.148,
-          Math.sin(i * Math.PI * 0.4) * 0.115, Math.cos(i * Math.PI * 0.4) * 0.115)
-        spoke.rotation.x = -i * Math.PI * 0.4
-      }
+      for (const { geometry, material } of wheelParts) spin.add(new T.Mesh(geometry, material))
+      spin.add(new T.Mesh(rimFace, trim))
       pivot.add(spin)
       pivot.position.set(side * 0.85, 0.33, z)
       root.add(pivot)

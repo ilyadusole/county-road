@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createControls, defaultKeys, deviceKey, loadBindings, newBinding, readGamepad, saveBindings } from './controls.js'
 import { tireForces } from './tires.js'
-import { createCar, createStepper, NEUTRAL, STEP, stepCar } from './vehicle.js'
+import { createCar, createStepper, interpolateCarPose, NEUTRAL, STEP, stepCar } from './vehicle.js'
 import { PAD, SPAWN, isPaved, nearestRoad, roads } from './roads.js'
 
 const asphalt = () => true
@@ -21,9 +21,11 @@ test('analog throttle affects acceleration and brakes hold a complete stop', () 
   assert.equal(full.heading, 0)
   drive(full, 4, { brake: 1 })
   assert.equal(full.u, 0)
+  const stoppedWheelAngle = full.wheelAngle
   full.reverse = true
   drive(full, 1, { throttle: 0.4 })
   assert.ok(full.u < -1)
+  assert.ok(full.wheelAngle < stoppedWheelAngle)
 })
 
 test('a throttle-induced slide can be caught with early countersteer', () => {
@@ -77,6 +79,27 @@ test('fixed-step replay matches between 30 and 60 FPS', () => {
     return [car.x, car.z, car.heading]
   }
   assert.deepEqual(replay(30), replay(60))
+})
+
+test('rendered motion follows frame time at 216 km/h with uneven frame intervals', () => {
+  const metersPerSecond = 60
+  const car = { ...createCar(), u: metersPerSecond }
+  const previous = { ...car }
+  const pose = {}
+  const frame = createStepper(() => {
+    Object.assign(previous, car)
+    car.z += metersPerSecond * STEP
+    car.wheelAngle += metersPerSecond * STEP / 0.33
+  })
+  let renderTime = -STEP
+  for (const elapsed of [1 / 60, 1 / 144, 1 / 120, 1 / 50, 1 / 144, 1 / 90, 1 / 40]) {
+    renderTime += elapsed
+    const fraction = frame(elapsed)
+    interpolateCarPose(previous, car, fraction, pose)
+    const expectedDistance = metersPerSecond * renderTime
+    assert.ok(Math.abs(pose.z - expectedDistance) < 1e-9)
+    assert.ok(Math.abs(pose.wheelAngle * 0.33 - expectedDistance) < 1e-9)
+  }
 })
 
 test('roads connect at the junctions and recovery points face along paved road', () => {
