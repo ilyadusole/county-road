@@ -1,0 +1,113 @@
+import { tireForces } from './tires.js'
+
+const MASS = 1450
+const INERTIA = 2360
+const FRONT = 1.23
+const REAR = 1.39
+const TRACK = 1.6
+const GRAVITY = 9.81
+const GEARS = [3.42, 2.23, 1.58, 1.19, 0.94, 0.77]
+const FINAL_DRIVE = 3.63
+const WHEEL_RADIUS = 0.33
+const WHEELS = [[-1, FRONT], [1, FRONT], [-1, -REAR], [1, -REAR]]
+export const STEP = 1 / 120
+export const NEUTRAL = { steer: 0, throttle: 0, brake: 0 }
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+
+export function createCar({ x = 0, z = 0, heading = 0 } = {}) {
+  return {
+    x, z, heading, u: 0, v: 0, yaw: 0, steer: 0, gear: 1, reverse: false,
+    rpm: 850, ax: 0, ay: 0, shiftDelay: 0, slip: 0,
+  }
+}
+
+export function stepCar(car, input, isPaved) {
+  const { u, v, yaw } = car
+  const speed = Math.hypot(u, v)
+  const cos = Math.cos(car.heading)
+  const sin = Math.sin(car.heading)
+  const steerLimit = Math.min(0.54, Math.atan2((FRONT + REAR) * 20, u ** 2 + 55))
+  const keyboardRange = input.keyboardSteering ? 1 - 0.32 * clamp((speed - 6) / 10, 0, 1) : 1
+  const desiredSteer = input.steer * steerLimit * keyboardRange
+  const steerRate = input.keyboardSteering ? 1.45 : 3.2
+  car.steer += clamp(desiredSteer - car.steer, -steerRate * STEP, steerRate * STEP)
+
+  const wheelRpm = Math.abs(u) * 60 / (2 * Math.PI * WHEEL_RADIUS)
+  car.shiftDelay = Math.max(0, car.shiftDelay - STEP)
+  if (!car.reverse && car.shiftDelay === 0) {
+    const currentRpm = wheelRpm * GEARS[car.gear - 1] * FINAL_DRIVE
+    const downshiftRpm = car.gear > 1 ? wheelRpm * GEARS[car.gear - 2] * FINAL_DRIVE : Infinity
+    if (currentRpm > 6450 && car.gear < GEARS.length) {
+      car.gear++
+      car.shiftDelay = 0.22
+    } else if (downshiftRpm < (input.throttle > 0.65 ? 4750 : 3000)) {
+      car.gear--
+      car.shiftDelay = 0.22
+    }
+  }
+  const ratio = (car.reverse ? 3.25 : GEARS[car.gear - 1]) * FINAL_DRIVE
+  car.rpm = clamp(wheelRpm * ratio, 850, 6900)
+  const torque = 445 * (0.77 + 0.23 * Math.sin(Math.PI * car.rpm / 7600))
+  const limiter = clamp((7000 - car.rpm) / 650, 0, 1) * (car.reverse ? clamp((9 - speed) / 2, 0, 1) : 1)
+  const drive = input.throttle * torque * ratio * 0.88 * limiter / WHEEL_RADIUS
+    * (car.reverse ? -1 : 1) * (car.shiftDelay > 0.1 ? 0.38 : 1)
+
+  const wheelbase = FRONT + REAR
+  const frontLoad = MASS * GRAVITY * REAR / wheelbase
+  const pitch = clamp(MASS * car.ax * 0.51 / wheelbase, -3500, 3500)
+  const roll = clamp(MASS * car.ay * 0.51 / TRACK, -3400, 3400)
+  let forwardForce = -0.43 * u * Math.abs(u)
+  let rightForce = 0
+  let moment = 0
+  let rearSlip = 0
+
+  for (const [side, forwardOffset] of WHEELS) {
+    const front = forwardOffset > 0
+    const rightOffset = side * TRACK / 2
+    // The camera faces +Z at zero heading, so screen-right points toward -X.
+    const wheelX = car.x - rightOffset * cos + forwardOffset * sin
+    const wheelZ = car.z + rightOffset * sin + forwardOffset * cos
+    const paved = isPaved(wheelX, wheelZ)
+    const load = Math.max(400, (front ? frontLoad - pitch : MASS * GRAVITY - frontLoad + pitch) / 2
+      - roll * side * (front ? 0.53 : 0.47))
+    const angle = front ? car.steer : 0
+    const c = Math.cos(angle)
+    const s = Math.sin(angle)
+    const wheelForward = u - yaw * rightOffset
+    const wheelRight = v + yaw * forwardOffset
+    const longitudinal = wheelForward * c + wheelRight * s
+    const lateral = wheelRight * c - wheelForward * s
+    const braking = input.brake * (front ? 5600 : 3300)
+    const engineDrag = front || input.throttle > 0.03 ? 0 : 125
+    const { fx, fy, slipAngle } = tireForces(paved, load, longitudinal, lateral,
+      front ? 0 : drive / 2, braking + engineDrag, front, MASS / (4 * STEP))
+    const localForward = fx * c - fy * s
+    const localRight = fx * s + fy * c
+    forwardForce += localForward
+    rightForce += localRight
+    moment += forwardOffset * localRight - rightOffset * localForward
+    if (!front) rearSlip = Math.max(rearSlip, Math.abs(slipAngle))
+  }
+
+  car.ax += (forwardForce / MASS - car.ax) * 0.08
+  car.ay += (rightForce / MASS - car.ay) * 0.08
+  car.slip = rearSlip
+  car.u += (forwardForce / MASS + yaw * v) * STEP
+  car.v += (rightForce / MASS - yaw * u) * STEP
+  car.yaw += moment / INERTIA * STEP
+  if (speed < 0.12 && input.throttle < 0.015) car.u = car.v = car.yaw = 0
+  car.heading -= car.yaw * STEP
+  car.x += (Math.sin(car.heading) * car.u - Math.cos(car.heading) * car.v) * STEP
+  car.z += (Math.cos(car.heading) * car.u + Math.sin(car.heading) * car.v) * STEP
+}
+
+export function createStepper(update) {
+  let accumulator = 0
+  return elapsed => {
+    accumulator += Math.min(elapsed, 0.1)
+    while (accumulator + 1e-9 >= STEP) {
+      update()
+      accumulator = Math.max(0, accumulator - STEP)
+    }
+  }
+}
