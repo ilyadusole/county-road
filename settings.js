@@ -116,8 +116,8 @@ export function createSettings(config, onChange) {
     deviceFields.hidden = !device
     reset.disabled = panel === 'devices' && !device
     deviceHelp.textContent = device
-      ? 'Choose an input or use Detect. For an axis, hold it in each named position and click its calibration button.'
-      : 'Connect a controller or wheel and move an axis or press a button to make it visible to the browser.'
+      ? 'Use Detect with the wheel centred and pedals released. Then move one control and use the calibration buttons to record its full range.'
+      : 'Connect a controller or wheel, then press a button on it with this tab focused. For a Fanatec CSL DD, try yellow PC Compatibility mode if it does not appear.'
     if (!device) return
     const profile = deviceBindings(config, device)
     Object.entries(DEVICE_ACTIONS).forEach(([action, label]) => {
@@ -216,23 +216,25 @@ export function createSettings(config, onChange) {
 
   function detectInput(device) {
     const { action, axes, buttons } = capture
-    let kind
-    let index
-    if (!centeredAction(action)) {
-      index = device.buttons.findIndex((input, i) => input.value - (buttons[i] ?? 0) > 0.3)
-      if (index !== -1) kind = 'button'
-    }
-    if (!kind && !buttonAction(action)) {
-      let strongest = 0.28
+    const digital = buttonAction(action)
+    const centered = centeredAction(action)
+    const standard = device.mapping === 'standard'
+    const buttonIndex = centered ? -1 : device.buttons.findIndex(
+      (input, i) => input.value - (buttons[i] ?? 0) > 0.3,
+    )
+    let axisIndex = -1
+    if (!digital && (!standard || buttonIndex === -1)) {
+      let strongest = standard ? 0.28 : 0.06
       device.axes.forEach((value, i) => {
         const movement = Math.abs(value - axes[i])
-        if (movement <= strongest) return
+        if (!Number.isFinite(movement) || movement <= strongest) return
         strongest = movement
-        kind = 'axis'
-        index = i
+        axisIndex = i
       })
     }
-    if (!kind) return
+    if (axisIndex === -1 && buttonIndex === -1) return
+    const kind = axisIndex === -1 ? 'button' : 'axis'
+    const index = axisIndex === -1 ? buttonIndex : axisIndex
     const binding = newBinding(action, kind, index, device.mapping === 'standard')
     if (kind === 'axis' && !centeredAction(action)) {
       binding.start = axes[index]
@@ -265,6 +267,12 @@ export function createSettings(config, onChange) {
 
   select('open-settings').addEventListener('click', open)
   select('close-settings').addEventListener('click', () => dialog.close())
+  dialog.addEventListener('cancel', event => {
+    // A platform close request may come from the native select picker.
+    if (dialog.contains(document.activeElement) && document.activeElement.tagName === 'SELECT') {
+      event.preventDefault()
+    }
+  })
   dialog.addEventListener('close', () => {
     cancelCapture()
     select('game').focus({ preventScroll: true })
