@@ -192,7 +192,7 @@ renderer.setAnimationLoop(now => {
   touch.apply(input, paused)
   settings.update(input.devices)
   if (paused) {
-    drivingAudio.update(now, car, 0, true)
+    drivingAudio.update(now, car, input, true)
     return
   }
   if (input.reset) recover('Recovered to the nearest road')
@@ -206,7 +206,7 @@ renderer.setAnimationLoop(now => {
     }
   }
   const fraction = advance(delta)
-  drivingAudio.update(now, car, input.throttle, false)
+  drivingAudio.update(now, car, input, false)
   interpolateCarPose(previousCar, car, fraction, pose)
   renderCar()
   updateCamera(delta)
@@ -238,7 +238,7 @@ function createDrivingAudio(settingsButton) {
     master.connect(context.destination)
     const engine = context.createOscillator()
     // The second harmonic represents two combustion pulses per crank revolution.
-    const harmonics = new Float32Array([0, 0.32, 1, 0.12, 0.49, 0.08, 0.23, 0.045, 0.13])
+    const harmonics = new Float32Array([0, 0.32, 1, 0.24, 0.59, 0.17, 0.38, 0.13, 0.26, 0.09, 0.17, 0.06, 0.11])
     engine.setPeriodicWave(context.createPeriodicWave(new Float32Array(harmonics.length), harmonics))
     const noise = context.createBufferSource()
     noise.buffer = context.createBuffer(1, context.sampleRate * 2, context.sampleRate)
@@ -261,10 +261,12 @@ function createDrivingAudio(settingsButton) {
 
     const exhaust = voice(engine, 'lowpass', 260, 0.7)
     const rolling = voice(noise, 'bandpass', 1150, 0.65)
-    const sliding = voice(noise, 'bandpass', 1750, 3)
+    const sliding = voice(noise, 'bandpass', 1750, 7.5)
+    const intake = voice(noise, 'bandpass', 860, 1.2)
+    const braking = voice(noise, 'bandpass', 900, 1.6)
     engine.start()
     noise.start()
-    return { context, master: master.gain, pitch: engine.frequency, exhaust, rolling, sliding }
+    return { context, master: master.gain, pitch: engine.frequency, exhaust, rolling, sliding, intake, braking }
   }
 
   function fade(play) {
@@ -297,24 +299,30 @@ function createDrivingAudio(settingsButton) {
   })
 
   return {
-    update(now, car, throttle, paused) {
+    update(now, car, input, paused) {
       const play = enabled && !paused && !document.hidden
       fade(play)
       if (!play || now - lastMix < 1000 / 30) return
       lastMix = now
-      const { context, pitch, exhaust, rolling, sliding } = graph
+      const { context, pitch, exhaust, rolling, sliding, intake, braking } = graph
+      const { throttle, brake } = input
       const time = context.currentTime
       const speed = Math.hypot(car.u, car.v)
       const road = isPaved(car.x, car.z)
       const load = car.shiftDelay > 0.1 ? throttle * 0.38 : throttle
       const motion = Math.min(1, speed / 34)
-      const slip = Math.min(1, Math.max(0, (car.slip - 0.11) / 0.28))
+      const slip = Math.min(1, Math.max(0, (car.pavedSlip - 0.045) / 0.17))
       pitch.setTargetAtTime(car.rpm / 60, time, 0.032)
-      exhaust.frequency.setTargetAtTime(220 + car.rpm * 0.07 + load * 580, time, 0.065)
-      exhaust.level.setTargetAtTime(0.075 + load * 0.19 + car.rpm * 0.000007, time, 0.065)
+      exhaust.frequency.setTargetAtTime(270 + car.rpm * 0.12 + load * 1100, time, 0.065)
+      exhaust.level.setTargetAtTime(0.12 + load * 0.30 + car.rpm * 0.000014, time, 0.065)
+      intake.frequency.setTargetAtTime(540 + car.rpm * 0.15, time, 0.07)
+      intake.level.setTargetAtTime(load * (0.045 + car.rpm * 0.000012), time, 0.07)
       rolling.frequency.setTargetAtTime((road ? 830 : 370) + motion * 470, time, 0.08)
       rolling.level.setTargetAtTime(motion * (road ? 0.12 : 0.28), time, 0.075)
-      sliding.level.setTargetAtTime(road ? slip * Math.min(1, speed / 9) * 0.28 : 0, time, 0.055)
+      sliding.frequency.setTargetAtTime(1450 + slip * 650 + motion * 180, time, 0.06)
+      sliding.level.setTargetAtTime(slip * Math.min(1, speed / 8) * 0.42, time, 0.05)
+      braking.frequency.setTargetAtTime(720 + motion * 630, time, 0.09)
+      braking.level.setTargetAtTime(brake * Math.min(1, speed / 8) * 0.11, time, 0.075)
     },
   }
 }
