@@ -26,6 +26,8 @@ Open the local URL printed by Vite in a WebGL 2 browser. Connect a standard Xbox
 
 Open **Settings** or press **Esc** to change keyboard bindings and configure connected controllers or wheels. Pick a device, then select an axis or button directly or click **Detect** and move the control. Use the calibration buttons at each named position to set the range for a steering wheel, stick, or pedal. The reading shows the raw input followed by the calibrated input. Bindings are saved in this browser by device. Wheels and pedals need to be exposed by the browser as game controllers.
 
+The sky and countryside come from [RC Flight Sim](https://github.com/jonsole/rc-flight-sim): a daylight sky with the sun placed for the time of day at an English latitude in midsummer, twilight and a starry night with a full moon, drifting cumulus whose shadows cross the ground, and rolling hills of farm fields, hedgerows and copses that fade into the horizon haze. The drivable area stays flat. Change the time of day and cloud cover on the **Sky** tab in **Settings** (`sky.js`, `landscape.js`).
+
 Each tire samples its own contact surface. Asphalt has sharper turn-in and stronger traction. Grass builds cornering force more slowly, adds rolling drag, and loses more grip at speed and when sliding.
 
 Run `npm test` for simulation and input checks, and `npm run build` for the static build.

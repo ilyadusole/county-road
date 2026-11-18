@@ -178,6 +178,17 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   border-radius: 4px;
   background: #101813;
 }
+.sky-row {
+  display: grid;
+  grid-template-columns: 105px minmax(0, 1fr) 48px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.sky-row input { accent-color: var(--accent); min-width: 0; }
+.sky-row output { color: var(--accent); text-align: right; font-variant-numeric: tabular-nums; }
 .settings-footer { margin-top: 13px; font-size: 13px; }
 #settings-status { color: var(--accent); }
 @media (max-width: 630px), (max-height: 530px) {

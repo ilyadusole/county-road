@@ -4,12 +4,13 @@ import { createSettings, keyLabel } from './settings.js'
 import { createCar, createStepper, interpolateCarPose, shiftGear, stepCar } from './vehicle.js'
 import { HALF_WORLD, LANDMARKS, PAD, SPAWN, isPaved, nearestRoad, resolveLandmarks, roads } from './roads.js'
 import { buildCar, buildWorld } from './scenery.js'
+import { createSky } from './sky.js'
 
 const select = id => document.getElementById(id)
 const notice = select('notice')
 const view = select('view')
 const scene = new T.Scene()
-const camera = new T.PerspectiveCamera(56, 1, 0.15, 2100)
+const camera = new T.PerspectiveCamera(56, 1, 0.3, 3600)
 const MAX_RENDER_PIXELS = 1920 * 1080
 let renderer
 try {
@@ -37,6 +38,8 @@ function resize() {
 window.addEventListener('resize', resize)
 resize()
 
+const sky = createSky(scene)
+setupSkySettings()
 buildWorld(scene)
 const model = buildCar(scene)
 const bindings = loadBindings()
@@ -208,6 +211,8 @@ renderer.setAnimationLoop(now => {
   settings.update(input.devices)
   if (paused) {
     drivingAudio.update(now, car, input, true)
+    renderer.toneMappingExposure = sky.state.exposure
+    renderer.render(scene, camera)
     return
   }
   if (input.reset) recover('Recovered to the nearest road')
@@ -228,8 +233,34 @@ renderer.setAnimationLoop(now => {
   renderCar()
   updateCamera(delta)
   updateHud(now)
+  sky.update(delta, camera)
+  renderer.toneMappingExposure = sky.state.exposure
   renderer.render(scene, camera)
 })
+
+function setupSkySettings() {
+  const KEY = 'county-road-sky'
+  let saved = {}
+  try { saved = JSON.parse(localStorage.getItem(KEY)) ?? {} } catch {}
+  const values = { hours: 15, clouds: 0.35, ...saved }
+  const time = select('time-of-day')
+  const clouds = select('cloud-cover')
+  function apply() {
+    values.hours = Number(time.value)
+    values.clouds = Number(clouds.value)
+    sky.setTime(values.hours)
+    sky.setClouds(values.clouds)
+    const minutes = Math.round(values.hours * 60) % 1440
+    select('time-of-day-value').textContent = `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`
+    select('cloud-cover-value').textContent = `${Math.round(values.clouds * 100)}%`
+    try { localStorage.setItem(KEY, JSON.stringify(values)) } catch {}
+  }
+  time.value = values.hours
+  clouds.value = values.clouds
+  time.addEventListener('input', apply)
+  clouds.addEventListener('input', apply)
+  apply()
+}
 
 function createDrivingAudio(settingsButton) {
   const toolbar = document.createElement('div')

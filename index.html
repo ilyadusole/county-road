@@ -50,6 +50,7 @@
       <nav class="settings-nav" aria-label="Control groups">
         <button type="button" data-panel="keyboard" aria-pressed="true">Keyboard</button>
         <button type="button" data-panel="devices" aria-pressed="false">Controllers &amp; wheels</button>
+        <button type="button" data-panel="sky" aria-pressed="false">Sky</button>
       </nav>
       <section id="keyboard-settings" aria-label="Keyboard bindings">
         <p class="settings-help">Choose a binding and press a key. Backspace clears it.</p>
@@ -61,6 +62,11 @@
           <label class="device-picker">Device <select id="input-device"></select></label>
           <div id="device-bindings"></div>
         </div>
+      </section>
+      <section id="sky-settings" aria-label="Sky and time of day" hidden>
+        <p class="settings-help">Midsummer in the English countryside. Saved in this browser.</p>
+        <label class="sky-row">Time of day <input id="time-of-day" type="range" min="0" max="24" step="0.25"> <output id="time-of-day-value"></output></label>
+        <label class="sky-row">Cloud cover <input id="cloud-cover" type="range" min="0" max="1" step="0.05"> <output id="cloud-cover-value"></output></label>
       </section>
       <footer class="settings-footer">
         <button id="reset-bindings" type="button">Restore keyboard defaults</button>
