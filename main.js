@@ -635,6 +635,72 @@ function mixRecordedEngine(graph, rpm, gain, time) {
   }
 }
 
+function createDriveStick(horizontal) {
+  const track = document.createElement('div')
+  track.className = horizontal ? 'drive-stick stick-steering' : 'drive-stick stick-pedals'
+  track.setAttribute('role', 'group')
+  track.setAttribute('aria-label', horizontal ? 'Steering joystick' : 'Throttle and brake joystick')
+  const markers = horizontal ? ['←', '→'] : ['Gas', 'Brake']
+  for (const [index, text] of markers.entries()) {
+    const label = document.createElement('span')
+    label.className = index === 0 ? 'stick-start' : 'stick-end'
+    label.textContent = text
+    label.setAttribute('aria-hidden', 'true')
+    track.append(label)
+  }
+  const thumb = document.createElement('span')
+  thumb.className = 'stick-thumb'
+  thumb.setAttribute('aria-hidden', 'true')
+  track.append(thumb)
+  let pointerId = null
+  let centre = 0
+  let travel = 1
+  let value = 0
+
+  function update(event) {
+    const delta = (horizontal ? event.clientX : event.clientY) - centre
+    const offset = Math.max(-travel, Math.min(travel, delta))
+    const amount = (horizontal ? offset : -offset) / travel
+    value = Math.sign(amount) * Math.max(0, (Math.abs(amount) - 0.09) / 0.91)
+    thumb.style.setProperty('--stick-offset', offset + 'px')
+  }
+
+  function clear() {
+    const id = pointerId
+    if (id === null) return
+    pointerId = null
+    value = 0
+    track.removeAttribute('data-held')
+    thumb.style.removeProperty('--stick-offset')
+    if (track.hasPointerCapture(id)) track.releasePointerCapture(id)
+  }
+
+  track.addEventListener('pointerdown', event => {
+    if (pointerId !== null || event.button !== 0) return
+    event.preventDefault()
+    const bounds = track.getBoundingClientRect()
+    const size = horizontal ? bounds.width : bounds.height
+    const grip = horizontal ? thumb.offsetWidth : thumb.offsetHeight
+    centre = (horizontal ? bounds.left : bounds.top) + size / 2
+    travel = Math.max(1, (size - grip) / 2 - 5)
+    track.setPointerCapture(event.pointerId)
+    pointerId = event.pointerId
+    track.setAttribute('data-held', '')
+    update(event)
+  })
+  track.addEventListener('pointermove', event => {
+    if (event.pointerId === pointerId) update(event)
+  })
+  for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    track.addEventListener(event, event => {
+      if (event.pointerId === pointerId) clear()
+    })
+  }
+  track.addEventListener('contextmenu', event => event.preventDefault())
+
+  return { track, held: () => pointerId !== null, value: () => value, clear }
+}
+
 function createTouchDriving(game) {
   const style = document.createElement('style')
   style.textContent = `
@@ -643,6 +709,7 @@ function createTouchDriving(game) {
       height: 100dvh;
       bottom: auto;
       --touch-size: clamp(52px, min(15vw, 18dvh), 80px);
+      --stick-size: clamp(92px, min(27vw, 33dvh), 140px);
       --touch-left: max(12px, env(safe-area-inset-left, 0px));
       --touch-right: max(12px, env(safe-area-inset-right, 0px));
       --touch-bottom: max(12px, env(safe-area-inset-bottom, 0px));
@@ -655,7 +722,7 @@ function createTouchDriving(game) {
     .touch-game .map { top: var(--touch-top); right: var(--touch-right); padding: 6px 8px; }
     .touch-game #map { width: clamp(64px, 19vw, 102px); }
     .touch-game .dash {
-      bottom: calc(var(--touch-bottom) + var(--touch-size) + 53px);
+      bottom: calc(var(--touch-bottom) + var(--stick-size) + 53px);
       right: var(--touch-right);
       width: 124px;
       padding: 7px 8px;
@@ -665,11 +732,50 @@ function createTouchDriving(game) {
     .touch-game #notice { top: 30%; width: max-content; max-width: 75%; }
     .touch-driving { position: absolute; inset: 0; pointer-events: none; }
     .touch-driving > div { position: absolute; display: flex; gap: 7px; }
-    .touch-driving .steering { left: var(--touch-left); bottom: var(--touch-bottom); }
-    .touch-driving .pedals { right: var(--touch-right); bottom: var(--touch-bottom); }
+    .touch-driving .drive-stick {
+      display: block;
+      bottom: var(--touch-bottom);
+      width: var(--stick-size);
+      height: var(--stick-size);
+      border: 1px solid #ffffff67;
+      border-radius: 50%;
+      background: #121b17cf;
+      box-shadow: inset 0 0 16px #0a0f0bc0, 0 3px 12px #0a0f0b55;
+      pointer-events: auto;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .stick-steering { left: var(--touch-left); }
+    .stick-pedals { right: var(--touch-right); }
+    .drive-stick span { position: absolute; pointer-events: none; }
+    .stick-start, .stick-end { color: #f4f6e9; font-size: 11px; font-weight: 700; line-height: 1; }
+    .stick-steering .stick-start, .stick-steering .stick-end { top: 50%; translate: 0 -50%; font-size: 17px; }
+    .stick-steering .stick-start { left: 9px; }
+    .stick-steering .stick-end { right: 9px; }
+    .stick-pedals .stick-start, .stick-pedals .stick-end { left: 50%; translate: -50% 0; }
+    .stick-pedals .stick-start { top: 8px; color: var(--accent); }
+    .stick-pedals .stick-end { bottom: 8px; }
+    .stick-thumb {
+      top: 50%;
+      left: 50%;
+      width: 40%;
+      height: 40%;
+      border-radius: 50%;
+      border: 2px solid #f6d99a;
+      background: #5c4930;
+      box-shadow: 0 3px 9px #0009;
+      transform: translate(calc(-50% + var(--stick-x, 0px)), calc(-50% + var(--stick-y, 0px)));
+      transition: transform 100ms ease-out;
+    }
+    .stick-steering .stick-thumb { --stick-x: var(--stick-offset, 0px); }
+    .stick-pedals .stick-thumb { --stick-y: var(--stick-offset, 0px); }
+    .drive-stick[data-held] .stick-thumb { transition: none; background: #826340; }
     .touch-driving .drive-actions {
       right: var(--touch-right);
-      bottom: calc(var(--touch-bottom) + var(--touch-size) + 7px);
+      bottom: calc(var(--touch-bottom) + var(--stick-size) + 7px);
     }
     .touch-driving button {
       pointer-events: auto;
@@ -685,17 +791,15 @@ function createTouchDriving(game) {
       background: #121b17e0;
       padding: 0;
     }
-    .touch-driving .steering button { font-size: 24px; }
-    .touch-driving .accelerate { color: var(--accent); }
     .touch-driving .shift-actions {
       left: var(--touch-left);
-      bottom: calc(var(--touch-bottom) + var(--touch-size) + 7px);
+      bottom: calc(var(--touch-bottom) + var(--stick-size) + 7px);
     }
     .touch-driving .drive-actions button, .touch-driving .shift-actions button { height: 44px; font-size: 11px; }
     .drive-toolbar .settings-toggle { white-space: nowrap; }
     .touch-game .drive-toolbar { max-width: 195px; }
     .audio-credits { color: var(--muted); }
-    .touch-driving button[data-held], .touch-driving button:active { color: #232318; background: var(--accent); }
+    .touch-driving button:active { color: #232318; background: var(--accent); }
     @media (orientation: landscape) {
       .touch-game .dash { bottom: var(--touch-bottom); left: 50%; right: auto; transform: translateX(-50%); }
       .touch-game #map { width: clamp(64px, 20dvh, 102px); }
@@ -708,15 +812,17 @@ function createTouchDriving(game) {
   const overlay = document.createElement('section')
   overlay.className = 'touch-driving'
   overlay.setAttribute('aria-label', 'On-screen driving controls')
-  const held = new Map()
+  const steering = createDriveStick(true)
+  const pedals = createDriveStick(false)
+  overlay.append(steering.track, pedals.track)
   let reverse = false
   let recover = false
   let shift = 0
   let active = false
 
   function clear() {
-    for (const control of held.values()) control.removeAttribute('data-held')
-    held.clear()
+    steering.clear()
+    pedals.clear()
     reverse = false
     recover = false
     shift = 0
@@ -732,46 +838,26 @@ function createTouchDriving(game) {
   function controls(className, items) {
     const group = document.createElement('div')
     group.className = className
-    for (const [action, text, label, tap] of items) {
+    for (const [text, label, tap] of items) {
       const control = document.createElement('button')
       control.type = 'button'
       control.textContent = text
-      control.className = action
       control.setAttribute('aria-label', label)
       control.addEventListener('contextmenu', event => event.preventDefault())
-      if (tap) {
-        control.addEventListener('click', tap)
-      } else {
-        control.addEventListener('pointerdown', event => {
-          if (event.button !== 0) return
-          event.preventDefault()
-          control.setPointerCapture(event.pointerId)
-          held.set(event.pointerId, control)
-          control.setAttribute('data-held', '')
-        })
-        const release = event => {
-          held.delete(event.pointerId)
-          if (![...held.values()].includes(control)) control.removeAttribute('data-held')
-        }
-        for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
-          control.addEventListener(event, release)
-        }
-      }
+      control.addEventListener('click', tap)
       group.append(control)
     }
     overlay.append(group)
     return group
   }
 
-  controls('steering', [['left', '←', 'Steer left'], ['right', '→', 'Steer right']])
-  controls('pedals', [['brake', 'Brake', 'Brake'], ['accelerate', 'Gas', 'Accelerate']])
   controls('drive-actions', [
-    ['reverse', 'Reverse', 'Toggle drive or reverse', () => { reverse = true }],
-    ['recover', 'Recover', 'Recover to the nearest road', () => { recover = true }],
+    ['Reverse', 'Toggle drive or reverse', () => { reverse = true }],
+    ['Recover', 'Recover to the nearest road', () => { recover = true }],
   ])
   const shiftButtons = controls('shift-actions', [
-    ['downshift', 'Gear −', 'Shift down', () => { shift = -1 }],
-    ['upshift', 'Gear +', 'Shift up', () => { shift = 1 }],
+    ['Gear −', 'Shift down', () => { shift = -1 }],
+    ['Gear +', 'Shift up', () => { shift = 1 }],
   ])
   shiftButtons.hidden = true
   game.append(overlay)
@@ -794,17 +880,14 @@ function createTouchDriving(game) {
         clear()
         return
       }
-      let left = false
-      let right = false
-      for (const { className } of held.values()) {
-        if (className === 'left') left = true
-        if (className === 'right') right = true
-        if (className === 'brake') input.brake = 1
-        if (className === 'accelerate') input.throttle = 1
+      if (steering.held()) {
+        input.steer = steering.value()
+        input.keyboardSteering = false
       }
-      if (left || right) {
-        input.steer = Number(right) - Number(left)
-        input.keyboardSteering = true
+      if (pedals.held()) {
+        const amount = pedals.value()
+        input.throttle = Math.max(0, amount)
+        input.brake = Math.max(0, -amount)
       }
       input.reverse ||= reverse
       input.reset ||= recover
