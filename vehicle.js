@@ -16,9 +16,20 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 
 export function createCar({ x = 0, z = 0, heading = 0 } = {}) {
   return {
-    x, z, heading, u: 0, v: 0, yaw: 0, steer: 0, gear: 1, reverse: false,
+    x, z, heading, u: 0, v: 0, yaw: 0, steer: 0, gear: 1, reverse: false, manual: false,
     rpm: 850, ax: 0, ay: 0, shiftDelay: 0, slip: 0, pavedSlip: 0, wheelAngle: 0,
   }
+}
+
+const wheelRpmAt = speed => Math.abs(speed) * 60 / (2 * Math.PI * WHEEL_RADIUS)
+
+export function shiftGear(car, direction) {
+  if (!car.manual || car.reverse || car.shiftDelay > 0.06) return
+  const gear = clamp(car.gear + direction, 0, GEARS.length)
+  if (gear === car.gear) return
+  if (direction < 0 && gear > 0 && wheelRpmAt(car.u) * GEARS[gear - 1] * FINAL_DRIVE > 6900) return
+  car.gear = gear
+  car.shiftDelay = 0.18
 }
 
 export function stepCar(car, input, isPaved) {
@@ -36,9 +47,13 @@ export function stepCar(car, input, isPaved) {
   const steerCos = Math.cos(car.steer)
   const steerSin = Math.sin(car.steer)
 
-  const wheelRpm = Math.abs(u) * 60 / (2 * Math.PI * WHEEL_RADIUS)
+  const wheelRpm = wheelRpmAt(u)
+  if (!car.manual && !car.reverse && car.gear === 0) {
+    const safeGear = GEARS.findIndex(gear => wheelRpm * gear * FINAL_DRIVE <= 6450)
+    car.gear = safeGear === -1 ? GEARS.length : safeGear + 1
+  }
   car.shiftDelay = Math.max(0, car.shiftDelay - STEP)
-  if (!car.reverse && car.shiftDelay === 0) {
+  if (!car.manual && !car.reverse && car.shiftDelay === 0) {
     const currentRpm = wheelRpm * GEARS[car.gear - 1] * FINAL_DRIVE
     const downshiftRpm = car.gear > 1 ? wheelRpm * GEARS[car.gear - 2] * FINAL_DRIVE : Infinity
     if (currentRpm > 6450 && car.gear < GEARS.length) {
@@ -49,8 +64,10 @@ export function stepCar(car, input, isPaved) {
       car.shiftDelay = 0.22
     }
   }
-  const ratio = (car.reverse ? 3.25 : GEARS[car.gear - 1]) * FINAL_DRIVE
-  car.rpm = clamp(wheelRpm * ratio, 850, 6900)
+  const ratio = (car.reverse ? 3.25 : GEARS[car.gear - 1] ?? 0) * FINAL_DRIVE
+  car.rpm = ratio === 0
+    ? car.rpm + (850 + 6050 * input.throttle - car.rpm) * 0.07
+    : clamp(wheelRpm * ratio, 850, 6900)
   const torque = 445 * (0.77 + 0.23 * Math.sin(Math.PI * car.rpm / 7600))
   const limiter = clamp((7000 - car.rpm) / 650, 0, 1) * (car.reverse ? clamp((9 - speed) / 2, 0, 1) : 1)
   const drive = input.throttle * torque * ratio * 0.88 * limiter / WHEEL_RADIUS
@@ -82,7 +99,7 @@ export function stepCar(car, input, isPaved) {
     const longitudinal = wheelForward * c + wheelRight * s
     const lateral = wheelRight * c - wheelForward * s
     const braking = input.brake * (front ? 5600 : 3300)
-    const engineDrag = front || input.throttle > 0.03 ? 0 : 125
+    const engineDrag = front || ratio === 0 || input.throttle > 0.03 ? 0 : 125
     const { fx, fy, slipAngle } = tireForces(paved, load, longitudinal, lateral,
       front ? 0 : drive / 2, braking + engineDrag, front, MASS / (4 * STEP))
     const localForward = fx * c - fy * s
