@@ -257,14 +257,18 @@ function createDrivingAudio(settingsButton) {
   let enabled = false
   let audible = false
   let lastMix = -Infinity
-  let lastThrottle = 0
-  let revUntil = 0
-  let revSource
 
   function buildGraph(context) {
     const master = context.createGain()
     master.gain.value = 0
-    master.connect(context.destination)
+    const limiter = context.createDynamicsCompressor()
+    limiter.threshold.value = -8
+    limiter.knee.value = 8
+    limiter.ratio.value = 4
+    limiter.attack.value = 0.01
+    limiter.release.value = 0.15
+    master.connect(limiter)
+    limiter.connect(context.destination)
     const engine = context.createOscillator()
     // The second harmonic represents two combustion pulses per crank revolution.
     const harmonics = new Float32Array([0, 0.32, 1, 0.24, 0.59, 0.17, 0.38, 0.13, 0.26, 0.09, 0.17, 0.06, 0.11])
@@ -316,11 +320,10 @@ function createDrivingAudio(settingsButton) {
     }
     button.disabled = true
     try {
-      const firstStart = !graph
       graph ??= buildGraph(new Audio())
       await graph.context.resume()
-      if (firstStart) {
-        void loadCarRecordings(graph, root).then(count => {
+      if (!graph.recordingLoad) {
+        graph.recordingLoad = loadCarRecordings(graph, root).then(count => {
           credits.hidden = count === 0
           button.title = count ? count + ' of 6 recorded car sounds loaded' : 'Synthesised audio'
         })
@@ -348,37 +351,15 @@ function createDrivingAudio(settingsButton) {
       const time = context.currentTime
       const speed = Math.hypot(car.u, car.v)
       const road = isPaved(car.x, car.z)
-      const load = car.shiftDelay > 0.1 ? throttle * 0.38 : throttle
+      const shift = Math.min(1, car.shiftDelay / 0.18)
+      const load = throttle * (1 - 0.56 * shift)
       const motion = Math.min(1, speed / 34)
       const slip = Math.min(1, Math.max(0, (car.pavedSlip - 0.045) / 0.17))
       const { recordings } = graph
-      if ((car.gear !== 0 || car.reverse) && revSource) {
-        revSource.stop()
-        revSource = undefined
-        revUntil = 0
-      }
-      if (car.gear === 0 && !car.reverse && throttle > 0.75 && lastThrottle < 0.3 && time >= revUntil && recordings.rev) {
-        const source = context.createBufferSource()
-        const level = context.createGain()
-        source.buffer = recordings.rev
-        source.connect(level)
-        level.gain.value = 0.55
-        level.connect(graph.output)
-        source.addEventListener('ended', () => {
-          source.disconnect()
-          level.disconnect()
-          if (revSource === source) revSource = undefined
-        }, { once: true })
-        source.start()
-        revSource = source
-        revUntil = time + recordings.rev.duration
-      }
-      lastThrottle = throttle
-      const hasEngines = graph.engines.length >= 2
-      const normalGain = time < revUntil ? 0.3 : 1
-      if (hasEngines) mixRecordedEngine(graph, car.rpm, normalGain * (0.68 + load * 0.62), time)
-      const synth = hasEngines ? 0.16 : normalGain
-      pitch.setTargetAtTime(car.rpm / 60, time, 0.032)
+      const hasEngines = graph.engines.length > 0 && time >= graph.engineStart
+      if (hasEngines) mixRecordedEngine(graph, car.rpm, 0.68 + load * 0.62, time)
+      const synth = hasEngines ? 0.08 : 1
+      pitch.setTargetAtTime(car.rpm / 60, time, 0.065)
       exhaust.frequency.setTargetAtTime(270 + car.rpm * 0.12 + load * 1100, time, 0.065)
       exhaust.level.setTargetAtTime(synth * (0.12 + load * 0.30 + car.rpm * 0.000014), time, 0.065)
       intake.frequency.setTargetAtTime(540 + car.rpm * 0.15, time, 0.07)
@@ -388,122 +369,247 @@ function createDrivingAudio(settingsButton) {
       sliding.frequency.setTargetAtTime(1450 + slip * 650 + motion * 180, time, 0.06)
       const squeal = slip * Math.min(1, speed / 8)
       sliding.level.setTargetAtTime(squeal * (recordings.tyre ? 0.08 : 0.42), time, 0.05)
-      recordings.tyre?.level.setTargetAtTime(squeal * 0.68, time, 0.05)
+      recordings.tyre?.level.setTargetAtTime(squeal * 0.68, time, 0.07)
+      recordings.tyre?.source.playbackRate.setTargetAtTime(0.86 + motion * 0.24 + slip * 0.08, time, 0.09)
       braking.frequency.setTargetAtTime(720 + motion * 630, time, 0.09)
       const brakeNoise = brake * Math.min(1, speed / 8)
       braking.level.setTargetAtTime(brakeNoise * (recordings.brake ? 0.025 : 0.11), time, 0.075)
-      recordings.brake?.level.setTargetAtTime(brakeNoise * 0.32, time, 0.075)
+      recordings.brake?.level.setTargetAtTime(brakeNoise * 0.32, time, 0.09)
+      recordings.brake?.source.playbackRate.setTargetAtTime(0.86 + motion * 0.19, time, 0.095)
     },
   }
 }
 
-function cutRecordingLoop(context, buffer, seconds, targetRpm) {
-  const samples = buffer.getChannelData(0)
-  const rate = buffer.sampleRate
-  const length = Math.min(samples.length, Math.round(seconds * rate))
-  const hop = Math.max(1, Math.round(rate / 4800))
-  const period = targetRpm ? rate * 20 / targetRpm : 0
-  const periods = targetRpm ? [0.84, 0.92, 1, 1.09, 1.19].map(factor => Math.round(period * factor)) : []
-  const windowStep = Math.round(rate * (targetRpm ? 0.6 : 0.15))
-  let offset = 0
-  let rpm = targetRpm
+const CYCLE_FRAMES = 2048
+
+function repeatCorrelation(samples, start, end, lag, step) {
+  let sum = 0
+  let previous = 0
+  let current = 0
+  for (let i = start + lag; i < end; i += step) {
+    const a = samples[i]
+    const b = samples[i - lag]
+    sum += a * b
+    current += a * a
+    previous += b * b
+  }
+  const energy = Math.sqrt(current * previous)
+  return energy > 0.0001 ? sum / energy : -1
+}
+
+function findEnginePeriod(samples, rate, targetRpm) {
+  const stride = Math.max(1, Math.round(rate / 4800))
+  const analysis = new Float32Array(Math.floor(samples.length / stride))
+  for (let i = 0; i < analysis.length; i++) {
+    let sum = 0
+    for (let j = 0; j < stride; j++) sum += samples[i * stride + j]
+    analysis[i] = sum / stride
+  }
+  const expected = rate * 20 / (stride * targetRpm)
+  const window = Math.min(analysis.length, Math.round(rate / stride * 0.42))
+  const hop = Math.max(1, Math.floor((analysis.length - window) / 96))
+  const candidates = new Set(Array.from({ length: 13 }, (_, i) => Math.round(expected * (0.82 + i * 0.03))))
   let best = -Infinity
-  for (let start = 0; start + length <= samples.length; start += windowStep) {
-    const end = start + length
-    if (targetRpm) {
-      // Find a repeating exhaust waveform near the target V6 firing rate.
-      for (const lag of periods) {
-        let cross = 0
-        let leftPower = 0
-        let rightPower = 0
-        for (let i = start + lag; i < end; i += hop * 2) {
-          const a = samples[i]
-          const b = samples[i - lag]
-          cross += a * b
-          leftPower += a * a
-          rightPower += b * b
-        }
-        const energy = Math.sqrt(leftPower * rightPower)
-        if (energy < 0.015) continue
-        const score = cross / energy - 0.32 * Math.abs(Math.log(lag / period))
-          + 0.03 * Math.log1p(energy)
-        if (score > best) {
-          best = score
-          offset = start
-          rpm = rate * 20 / lag
-        }
-      }
-    } else {
-      // Prefer the bright friction sound over the approaching engine rumble.
-      let edgePower = 0
-      for (let i = start + hop; i < end; i += hop) edgePower += (samples[i] - samples[i - hop]) ** 2
-      if (edgePower > best) {
-        best = edgePower
-        offset = start
-      }
+  let start = 0
+  let period = Math.round(expected)
+  for (let offset = 0; offset + window <= analysis.length; offset += hop) {
+    let power = 0
+    for (let i = offset; i < offset + window; i += 4) power += analysis[i] ** 2
+    if (power < 0.005) continue
+    const split = offset + Math.floor(window / 2)
+    for (const lag of candidates) {
+      const first = repeatCorrelation(analysis, offset, split, lag, 3)
+      const second = repeatCorrelation(analysis, split, offset + window, lag, 3)
+      const score = 0.68 * Math.min(first, second) + 0.16 * (first + second)
+        - 0.24 * Math.abs(Math.log(lag / expected)) + 0.042 * Math.log1p(power)
+      if (score <= best) continue
+      best = score
+      start = offset
+      period = lag
     }
   }
+
+  const begin = start * stride
+  const end = Math.min(samples.length, begin + window * stride)
+  const coarse = period * stride
+  const compare = lag => repeatCorrelation(samples, begin, end, lag, stride)
+  let fine = coarse
+  let fineScore = -Infinity
+  for (let lag = Math.max(2, coarse - stride * 2); lag <= coarse + stride * 2; lag++) {
+    const score = compare(lag)
+    if (score <= fineScore) continue
+    fineScore = score
+    fine = lag
+  }
+  const left = compare(fine - 1)
+  const right = compare(fine + 1)
+  const curvature = left + right - 2 * fineScore
+  const fraction = curvature < -1e-8 ? Math.max(-0.5, Math.min(0.5, (left - right) / (2 * curvature))) : 0
+  return { begin, end, period: fine + fraction }
+}
+
+function centerAndLevel(data) {
+  let dc = 0
+  for (const value of data) dc += value
+  dc /= data.length
   let power = 0
   let peak = 0
-  for (let i = 0; i < length; i++) {
-    const sample = samples[offset + i]
-    power += sample * sample
-    peak = Math.max(peak, Math.abs(sample))
+  for (let i = 0; i < data.length; i++) {
+    const value = data[i] - dc
+    data[i] = value
+    power += value * value
+    peak = Math.max(peak, Math.abs(value))
   }
-  const scale = Math.min(4, 0.22 / Math.sqrt(power / length), 0.92 / peak)
-  const overlap = Math.min(Math.floor(length / 5), Math.round(rate * 0.065))
-  const loop = context.createBuffer(1, length - overlap, rate)
-  const data = loop.getChannelData(0)
-  data.set(samples.subarray(offset + overlap, offset + length))
-  // Blend into the omitted start so the end rejoins the first frame smoothly.
+  if (peak === 0) return data
+  const gain = Math.min(10, 0.22 / Math.sqrt(power / data.length), 0.9 / peak)
+  for (let i = 0; i < data.length; i++) data[i] *= gain
+  return data
+}
+
+function engineCycle(samples, rate, targetRpm) {
+  const { begin, end, period } = findEnginePeriod(samples, rate, targetRpm)
+  const cycle = period * 6
+  const repeats = Math.floor((end - begin - 1) / cycle)
+  if (repeats < 2) throw new Error('Recording is too short for a V6 cycle')
+  const wave = new Float32Array(CYCLE_FRAMES)
+  // Fold full 720-degree cycles from the recording with a Hann-weighted overlap.
+  // The weights vanish at the ends, so phase 1 joins phase 0 continuously.
+  for (let i = 0; i < wave.length; i++) {
+    const phase = i / wave.length
+    let weightSum = 0
+    let total = 0
+    for (let n = 0; n < repeats; n++) {
+      const position = begin + (n + phase) * cycle
+      const index = Math.floor(position)
+      const sample = samples[index] + (samples[index + 1] - samples[index]) * (position - index)
+      const weight = Math.sin(Math.PI * (n + phase) / repeats) ** 2
+      total += sample * weight
+      weightSum += weight
+    }
+    wave[i] = total / weightSum
+  }
+  return { wave: centerAndLevel(wave), rpm: rate * 20 / period }
+}
+
+function alignEngineCycle(wave, reference) {
+  if (!reference) return { wave, correlation: 1 }
+  let bestShift = 0
+  let best = -Infinity
+  for (let shift = 0; shift < wave.length; shift++) {
+    let sum = 0
+    for (let i = 0; i < wave.length; i += 8) sum += reference[i] * wave[(i + shift) % wave.length]
+    if (sum <= best) continue
+    best = sum
+    bestShift = shift
+  }
+  const aligned = new Float32Array(wave.length)
+  let cross = 0
+  let aPower = 0
+  let bPower = 0
+  for (let i = 0; i < wave.length; i++) {
+    const a = reference[i]
+    const b = wave[(i + bestShift) % wave.length]
+    aligned[i] = b
+    cross += a * b
+    aPower += a * a
+    bPower += b * b
+  }
+  const correlation = Math.max(0, Math.min(1, cross / (Math.sqrt(aPower * bPower) || 1)))
+  return { wave: aligned, correlation }
+}
+
+function frictionLoop(samples, rate, seconds) {
+  const length = Math.min(samples.length, Math.round(rate * seconds))
+  const step = Math.max(1, Math.round(rate / 5200))
+  const overlap = Math.min(Math.floor(length / 4), Math.round(rate * 0.16))
+  const hop = Math.max(1, Math.round(rate * 0.085))
+  let bestOffset = 0
+  let best = -Infinity
+  for (let offset = 0; offset + length <= samples.length; offset += hop) {
+    const energy = [0, 0, 0, 0]
+    for (let i = step; i < length; i += step) {
+      const edge = samples[offset + i] - samples[offset + i - step]
+      energy[Math.floor(i * 4 / length)] += edge * edge
+    }
+    // Prefer sustained friction over sections dominated by a single loud transient.
+    const score = Math.min(...energy) + 0.17 * energy.reduce((sum, band) => sum + band, 0)
+    if (score <= best) continue
+    best = score
+    bestOffset = offset
+  }
+  const data = samples.slice(bestOffset + overlap, bestOffset + length)
   for (let i = 0; i < overlap; i++) {
     const index = data.length - overlap + i
-    const blend = i / Math.max(1, overlap - 1)
-    data[index] = data[index] * (1 - blend) + samples[offset + i] * blend
+    const fade = 0.5 - 0.5 * Math.cos(Math.PI * i / Math.max(1, overlap - 1))
+    const a = 1 - fade
+    data[index] = (data[index] * a + samples[bestOffset + i] * fade) / Math.hypot(a, fade)
   }
-  for (let i = 0; i < data.length; i++) data[i] *= scale
-  return { loop, rpm }
+  return centerAndLevel(data)
+}
+
+function createRecordingVoice(context, output, data, rate, highpass) {
+  const source = context.createBufferSource()
+  const gain = context.createGain()
+  source.buffer = context.createBuffer(1, data.length, rate)
+  source.buffer.copyToChannel(data, 0)
+  source.loop = true
+  gain.gain.value = 0
+  source.connect(gain)
+  if (highpass) {
+    const filter = context.createBiquadFilter()
+    filter.type = 'highpass'
+    filter.frequency.value = highpass
+    gain.connect(filter)
+    filter.connect(output)
+  } else {
+    gain.connect(output)
+  }
+  return { source, level: gain.gain, duration: source.buffer.duration }
 }
 
 async function loadCarRecordings(graph, root) {
   const { context, output } = graph
-  const clips = [
-    ['idle', 1.4, 850], ['mid', 1.1, 2900], ['high', 1.1, 5300],
-    ['tyre', 0.65, 0, 950], ['brake', 0.52, 0, 650], ['rev'],
-  ]
+  const engineClips = [['idle', 850], ['rev', 1650], ['mid', 2900], ['high', 5300]]
+  const frictionClips = [['tyre', 0.94, 950], ['brake', 0.8, 650]]
   let count = 0
-  for (const [name, duration, targetRpm, highpass] of clips) {
+  async function decode(name) {
+    const response = await fetch(root + name + '.mp3')
+    if (!response.ok) throw Error('HTTP ' + response.status)
+    return context.decodeAudioData(await response.arrayBuffer())
+  }
+  const cycles = []
+  for (const [name, targetRpm] of engineClips) {
     try {
-      const response = await fetch(root + name + '.mp3')
-      if (!response.ok) throw Error('HTTP ' + response.status)
-      const original = await context.decodeAudioData(await response.arrayBuffer())
-      if (duration) {
-        const { loop, rpm } = cutRecordingLoop(context, original, duration, targetRpm)
-        const source = context.createBufferSource()
-        const gain = context.createGain()
-        source.buffer = loop
-        source.loop = true
-        gain.gain.value = 0
-        source.connect(gain)
-        if (highpass) {
-          const filter = context.createBiquadFilter()
-          filter.type = 'highpass'
-          filter.frequency.value = highpass
-          gain.connect(filter)
-          filter.connect(output)
-        } else {
-          gain.connect(output)
-        }
-        source.start()
-        const recording = { speed: source.playbackRate, level: gain.gain, rpm }
-        if (targetRpm) graph.engines.push(recording)
-        else graph.recordings[name] = recording
-      } else {
-        graph.recordings.rev = original
-      }
+      const buffer = await decode(name)
+      cycles.push(engineCycle(buffer.getChannelData(0), buffer.sampleRate, targetRpm))
       count++
     } catch (error) {
-      console.warn('Could not load recorded car sound ' + name, error)
+      console.warn('Could not load recorded engine sound ' + name, error)
+    }
+  }
+  cycles.sort((a, b) => a.rpm - b.rpm)
+  let reference
+  const start = context.currentTime + 0.04
+  for (const { wave, rpm } of cycles) {
+    const aligned = alignEngineCycle(wave, reference)
+    reference = aligned.wave
+    const voice = createRecordingVoice(context, output, reference, context.sampleRate)
+    voice.source.playbackRate.value = voice.duration * 850 / 120
+    voice.source.start(start)
+    graph.engines.push({ ...voice, rpm, correlation: aligned.correlation })
+  }
+  graph.engineStart = start
+
+  for (const [name, seconds, highpass] of frictionClips) {
+    try {
+      const buffer = await decode(name)
+      const data = frictionLoop(buffer.getChannelData(0), buffer.sampleRate, seconds)
+      const voice = createRecordingVoice(context, output, data, buffer.sampleRate, highpass)
+      voice.source.start()
+      graph.recordings[name] = voice
+      count++
+    } catch (error) {
+      console.warn('Could not load recorded friction sound ' + name, error)
     }
   }
   return count
@@ -514,12 +620,18 @@ function mixRecordedEngine(graph, rpm, gain, time) {
   const next = engines.findIndex(engine => engine.rpm >= rpm)
   const upper = next < 0 ? engines.length - 1 : next
   const lower = next <= 0 ? upper : upper - 1
-  const span = engines[upper].rpm - engines[lower].rpm
-  const blend = span ? (rpm - engines[lower].rpm) / span : 0
+  const span = Math.log(engines[upper].rpm / engines[lower].rpm)
+  const progress = span > 0 ? Math.log(rpm / engines[lower].rpm) / span : 0
+  const blend = progress * progress * (3 - 2 * progress)
+  const partA = 1 - blend
+  const partB = blend
+  const correlation = engines[upper].correlation
+  const level = gain / Math.sqrt(partA ** 2 + partB ** 2 + 2 * partA * partB * correlation)
   for (const [index, engine] of engines.entries()) {
-    const weight = index === lower ? Math.sqrt(1 - blend) : index === upper ? Math.sqrt(blend) : 0
-    engine.speed.setTargetAtTime(Math.min(2, Math.max(0.55, rpm / engine.rpm)), time, 0.035)
-    engine.level.setTargetAtTime(weight * gain, time, 0.05)
+    const weight = index === lower ? partA : index === upper ? partB : 0
+    // Every source plays one full engine cycle at the same frequency and phase.
+    engine.source.playbackRate.setTargetAtTime(rpm * engine.duration / 120, time, 0.065)
+    engine.level.setTargetAtTime(level * weight, time, 0.075)
   }
 }
 
