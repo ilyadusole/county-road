@@ -24,6 +24,40 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+      - name: Package licensed car audio
+        run: |
+          mkdir -p dist/audio
+          download() {
+            curl --fail --location --retry 3 --max-time 30 --silent --show-error "$2" --output "dist/audio/$1.mp3"
+            test -s "dist/audio/$1.mp3"
+          }
+          download idle 'https://cdn.freesound.org/previews/754/754777_6823432-lq.mp3'
+          download mid 'https://cdn.freesound.org/previews/754/754776_6823432-lq.mp3'
+          download high 'https://cdn.freesound.org/previews/754/754775_6823432-lq.mp3'
+          download rev 'https://cdn.freesound.org/previews/755/755999_6823432-lq.mp3'
+          download tyre 'https://cdn.freesound.org/previews/454/454687_4415905-lq.mp3'
+          download brake 'https://cdn.freesound.org/previews/481/481702_2524442-lq.mp3'
+          cat > dist/audio/credits.txt <<'EOF'
+          County Road audio credits
+
+          3.2L V6 VTEC exhaust idle, medium and hard acceleration, and single rev by Evan Boyerman
+          https://freesound.org/people/EvanBoyerman/sounds/754777/
+          https://freesound.org/people/EvanBoyerman/sounds/754776/
+          https://freesound.org/people/EvanBoyerman/sounds/754775/
+          https://freesound.org/people/EvanBoyerman/sounds/755999/
+          Creative Commons Attribution 4.0 International https://creativecommons.org/licenses/by/4.0/
+          The game trims, loops, pitch-shifts, and mixes these recordings.
+
+          Passenger car braking on asphalt by YleArkisto
+          https://freesound.org/people/YleArkisto/sounds/454687/
+          Creative Commons Attribution 4.0 International https://creativecommons.org/licenses/by/4.0/
+          A short segment is trimmed and looped for tyre squeal.
+
+          Car with Squeaky Brakes by craigsmith
+          https://freesound.org/people/craigsmith/sounds/481702/
+          CC0 1.0 https://creativecommons.org/publicdomain/zero/1.0/
+          A short segment is trimmed and looped for brakes.
+          EOF
       - uses: actions/upload-pages-artifact@v4
         with:
           path: dist
