@@ -8,6 +8,8 @@ export const LANDMARKS = [
   { x: -48, z: 52, halfX: 8, halfZ: 6 },
   { x: 294, z: -103, halfX: 2.7, halfZ: 2.7 },
 ]
+// Where roads meet (the ends of the loops, the crossroads, the skidpad spur).
+export const JOINTS = [[0, -360], [0, 360], [-428, 0], [0, 28], [320, 0], [0, -238]]
 const CELL = 20
 const GRID_STRIDE = 2 * Math.ceil(HALF_WORLD / CELL) + 1
 const grid = new Map()
@@ -18,13 +20,48 @@ export const roads = [
   [[0, -360], [0, 360]],
   [[0, -360], [-140, -360], [-312, -320], [-413, -140], [-428, 0],
     [-427, 196], [-350, 330], [-200, 360], [0, 360]],
-  [[0, -360], [115, -360], [204, -285], [211, -207], [310, -170], [345, -55],
-    [320, 0], [285, 80], [342, 162], [339, 269], [230, 354], [0, 360]],
+  [[0, -360], [115, -360], [204, -285], [211, -207], [310, -170], [372, -112],
+    [392, -40], [320, 0], [282, 74], [338, 150], [372, 232], [318, 300], [230, 354], [0, 360]],
   [[-428, 0], [-300, 0], [-153, 30], [0, 28], [165, -12], [320, 0]],
   [[0, -238], [34, -238]],
 ].map(waypoints => {
   const curve = new CatmullRomCurve3(waypoints.map(([x, z]) => new Vector3(x, 0, z)))
   return curve.getSpacedPoints(Math.ceil(curve.getLength() / 3))
+})
+
+// How wide each road is, half each side of its centre (m): the main road a
+// steady two lanes; the loops are narrow lanes that wander in width; all
+// flare out where they meet another road. Each point carries its own `half`
+// and `along` (its distance along the road), and `markings`: 2 centre and
+// edge lines, 1 centre line, 0 none.
+export const ROAD_STYLE = [
+  { half: 5, wander: 0.18, markings: 2 }, // the main road, north to south
+  { half: 3.5, wander: 0.55, markings: 0 }, // west lane
+  { half: 3.7, wander: 0.5, markings: 0 }, // east lane
+  { half: 4.2, wander: 0.35, markings: 1 }, // the cross road
+  { half: 3.4, wander: 0, markings: 0 }, // the skidpad spur
+]
+function wobble(t) {
+  const i = Math.floor(t)
+  const f = t - i
+  const r = k => {
+    const v = Math.sin(k * 127.1 + 311.7) * 43758.5453
+    return v - Math.floor(v)
+  }
+  return (r(i) + (r(i + 1) - r(i)) * f * f * (3 - 2 * f)) * 2 - 1
+}
+export const MAX_HALF = 7
+roads.forEach((points, index) => {
+  const style = ROAD_STYLE[index]
+  let along = 0
+  points.forEach((p, i) => {
+    if (i > 0) along += p.distanceTo(points[i - 1])
+    const flare = Math.max(0, ...JOINTS.map(([x, z]) => 1 - Math.hypot(p.x - x, p.z - z) / 24))
+    p.along = along
+    p.half = style.half + style.wander * (0.65 * wobble(along / 90 + index * 17) + 0.35 * wobble(along / 23 + index * 5))
+      + 1.6 * flare * flare
+    p.markings = style.markings
+  })
 })
 
 for (const points of roads) {
@@ -35,10 +72,10 @@ for (const points of roads) {
     const dz = b.z - a.z
     const segment = { a, b, dx, dz, lengthSquared: dx * dx + dz * dz }
     segments.push(segment)
-    for (let x = Math.floor((Math.min(a.x, b.x) - ROAD_HALF) / CELL);
-      x <= Math.floor((Math.max(a.x, b.x) + ROAD_HALF) / CELL); x++) {
-      for (let z = Math.floor((Math.min(a.z, b.z) - ROAD_HALF) / CELL);
-        z <= Math.floor((Math.max(a.z, b.z) + ROAD_HALF) / CELL); z++) {
+    for (let x = Math.floor((Math.min(a.x, b.x) - MAX_HALF) / CELL);
+      x <= Math.floor((Math.max(a.x, b.x) + MAX_HALF) / CELL); x++) {
+      for (let z = Math.floor((Math.min(a.z, b.z) - MAX_HALF) / CELL);
+        z <= Math.floor((Math.max(a.z, b.z) + MAX_HALF) / CELL); z++) {
         const id = key(x, z)
         if (!grid.has(id)) grid.set(id, [])
         grid.get(id).push(segment)
@@ -58,8 +95,9 @@ export function isPaved(x, z) {
   if (!nearby) return false
   for (const segment of nearby) {
     const t = project(x, z, segment)
+    const half = segment.a.half + (segment.b.half - segment.a.half) * t
     if ((x - segment.a.x - t * segment.dx) ** 2
-      + (z - segment.a.z - t * segment.dz) ** 2 <= ROAD_HALF ** 2) return true
+      + (z - segment.a.z - t * segment.dz) ** 2 <= half ** 2) return true
   }
   return false
 }

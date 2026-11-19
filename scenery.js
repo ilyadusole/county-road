@@ -1,32 +1,12 @@
 import * as T from 'three'
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
-import { HALF_WORLD, LANDMARKS, PAD, ROAD_HALF, roads } from './roads.js'
+import { JOINTS, LANDMARKS, PAD, roads } from './roads.js'
+import { asphaltMaterial, buildMarkerPosts, buildVillageEdges, roadStrip, vergeMaterial } from './roadSurface.js'
+import { addCloudShadows } from './sky.js'
+import { buildTerrain } from './landscape.js'
+import { PAD_HEIGHT, heightAt } from './terrain.js'
 
-const matte = color => new T.MeshStandardMaterial({ color, roughness: 0.83 })
-const terrainMaterial = color => new T.MeshLambertMaterial({ color })
-let seed = 7392
-function random() {
-  seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
-  return seed / 4294967296
-}
-
-function texture(rgb, variance) {
-  const canvas = document.createElement('canvas')
-  canvas.width = canvas.height = 256
-  const context = canvas.getContext('2d')
-  const pixels = context.createImageData(256, 256)
-  for (let i = 0; i < pixels.data.length; i += 4) {
-    const value = (random() - 0.5) * variance
-    rgb.forEach((channel, offset) => { pixels.data[i + offset] = channel + value })
-    pixels.data[i + 3] = 255
-  }
-  context.putImageData(pixels, 0, 0)
-  const map = new T.CanvasTexture(canvas)
-  map.colorSpace = T.SRGBColorSpace
-  map.wrapS = map.wrapT = T.RepeatWrapping
-  map.anisotropy = 4
-  return map
-}
+const matte = color => addCloudShadows(new T.MeshStandardMaterial({ color, roughness: 0.83 }))
 
 const shadowGeometry = new T.PlaneGeometry().rotateX(-Math.PI / 2)
 let shadowTexture
@@ -59,94 +39,58 @@ function box(parent, material, sx, sy, sz, x, y, z) {
   return mesh
 }
 
-function groundGeometry(positions, indices) {
-  const geometry = new T.BufferGeometry()
-  geometry.setAttribute('position', new T.Float32BufferAttribute(positions, 3))
-  const uv = []
-  for (let i = 0; i < positions.length; i += 3) uv.push(positions[i] / 12, positions[i + 2] / 12)
-  geometry.setAttribute('uv', new T.Float32BufferAttribute(uv, 2))
-  geometry.setIndex(indices)
-  geometry.computeVertexNormals()
-  return geometry
-}
+// Road surfaces: lifted a few centimetres above the ground they're built
+// on, and drawn in front of it (polygon offset), so it never shows through.
+const lifted = (material, units) => Object.assign(material, { polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: units })
 
-function ribbon(points, half, height) {
-  const positions = []
-  const indices = []
-  points.forEach((p, i) => {
-    const tangent = points[Math.min(i + 1, points.length - 1)].clone()
-      .sub(points[Math.max(0, i - 1)]).normalize()
-    const nx = tangent.z * half
-    const nz = -tangent.x * half
-    positions.push(p.x - nx, height, p.z - nz, p.x + nx, height, p.z + nz)
-    if (i > 0) {
-      const a = i * 2 - 2
-      indices.push(a, a + 2, a + 1, a + 2, a + 3, a + 1)
-    }
-  })
-  return groundGeometry(positions, indices)
-}
-
-function disk(radius, x, z, material, height) {
-  const mesh = new T.Mesh(new T.CircleGeometry(radius, 96), material)
+function disk(radius, x, z, material, lift, level) {
+  const mesh = new T.Mesh(new T.CircleGeometry(radius, 96, 0, Math.PI * 2), material)
   mesh.geometry.rotateX(-Math.PI / 2)
   const p = mesh.geometry.attributes.position
   const uv = mesh.geometry.attributes.uv
-  for (let i = 0; i < p.count; i++) uv.setXY(i, (p.getX(i) + x) / 12, (p.getZ(i) + z) / 12)
-  mesh.position.set(x, height, z)
+  for (let i = 0; i < p.count; i++) {
+    uv.setXY(i, (p.getX(i) + x) / 3.2, (p.getZ(i) + z) / 3.2)
+    p.setY(i, (level ?? heightAt(p.getX(i) + x, p.getZ(i) + z)) + lift)
+  }
+  mesh.geometry.computeVertexNormals()
+  const count = p.count
+  mesh.geometry.setAttribute('aRoad', new T.Float32BufferAttribute(Array.from({ length: count }, (_, i) => [p.getX(i), p.getZ(i) + z]).flat(), 2))
+  mesh.geometry.setAttribute('aInfo', new T.Float32BufferAttribute(Array.from({ length: count }, () => [radius + 50, 0]).flat(), 2))
+  mesh.position.set(x, 0, z)
   return mesh
 }
 
 export function buildWorld(scene) {
-  scene.background = new T.Color(0xa9c9d7)
-  scene.fog = new T.FogExp2(0xb6cdd2, 0.00145)
-  scene.add(new T.HemisphereLight(0xe4f2ff, 0x8c9161, 2.05))
-  const sun = new T.DirectionalLight(0xffedcc, 2.3)
-  sun.position.set(-29, 43, -18)
-  scene.add(sun)
-
-  const grass = new T.MeshLambertMaterial({ map: texture([91, 109, 68], 35) })
-  const asphalt = new T.MeshLambertMaterial({ map: texture([54, 58, 57], 18) })
-  const shoulder = terrainMaterial(0x9c9675)
-  const ground = new T.Mesh(new T.PlaneGeometry(3600, 3600), grass)
-  ground.rotation.x = -Math.PI / 2
-  ground.material.map.repeat.set(300, 300)
-  scene.add(ground)
-  const joints = [[0, -360], [0, 360], [-428, 0], [0, 28], [320, 0], [0, -238]]
-  const paint = new T.MeshBasicMaterial({ color: 0xe0dac1 })
-  const dashGeometry = new T.PlaneGeometry(0.13, 3.1).rotateX(-Math.PI / 2)
-  const dashTransforms = []
+  buildTerrain(scene)
+  // The roads: worn asphalt over a muddy, gravelly margin that fades into
+  // the verge (roadSurface.js), kerbs and footways through the village,
+  // marker posts along the lanes.
+  const asphalt = asphaltMaterial()
+  const verge = vergeMaterial()
+  const paint = lifted(new T.MeshBasicMaterial({ color: 0xe0dac1 }), -6)
   const transforms = new T.Object3D()
   for (const points of roads) {
-    for (const [width, height, material] of [[5.42, 0.008, shoulder], [ROAD_HALF, 0.016, asphalt]]) {
-      const mesh = new T.Mesh(ribbon(points, width, height), material)
-      scene.add(mesh)
-    }
-    if (points === roads.at(-1)) continue
-    for (let i = 2; i < points.length - 1; i += 3) {
-      const p = points[i]
-      if (joints.some(([x, z]) => Math.hypot(p.x - x, p.z - z) < 10)) continue
-      const next = points[i + 1]
-      transforms.rotation.y = Math.atan2(next.x - p.x, next.z - p.z)
-      transforms.position.set(p.x, 0.026, p.z)
-      transforms.updateMatrix()
-      dashTransforms.push(transforms.matrix.clone())
-    }
+    scene.add(new T.Mesh(roadStrip(points, p => [-(p.half + 2.2), p.half + 2.2], p => p.y + 0.04), verge))
+    scene.add(new T.Mesh(roadStrip(points, p => [-p.half, p.half], p => p.y + 0.08), asphalt))
   }
-  const markings = new T.InstancedMesh(dashGeometry, paint, dashTransforms.length)
-  dashTransforms.forEach((matrix, i) => markings.setMatrixAt(i, matrix))
-  scene.add(markings)
-  for (const [x, z] of joints) scene.add(disk(ROAD_HALF, x, z, asphalt, 0.019))
-  scene.add(disk(PAD.radius, PAD.x, PAD.z, asphalt, 0.02))
+  buildVillageEdges(scene, roads, p => p.y)
+  buildMarkerPosts(scene, roads, heightAt)
+  // Junctions: a disc of asphalt where the roads meet, as wide as the widest mouth.
+  for (const [x, z] of JOINTS) {
+    let half = 3
+    for (const points of roads) for (const p of points) if (Math.hypot(p.x - x, p.z - z) < 2) half = Math.max(half, p.half)
+    scene.add(disk(half, x, z, asphalt, 0.085))
+  }
+  scene.add(disk(PAD.radius, PAD.x, PAD.z, asphalt, 0.085, PAD_HEIGHT))
   for (const radius of [10, 18]) {
     const ring = new T.Mesh(new T.RingGeometry(radius - 0.05, radius + 0.05, 80), paint)
     ring.rotation.x = -Math.PI / 2
-    ring.position.set(PAD.x, 0.027, PAD.z)
+    ring.position.set(PAD.x, PAD_HEIGHT + 0.1, PAD.z)
     scene.add(ring)
   }
 
   const barn = new T.Group()
-  barn.position.set(LANDMARKS[0].x, 0, LANDMARKS[0].z)
+  barn.position.set(LANDMARKS[0].x, LANDMARKS[0].y, LANDMARKS[0].z)
   scene.add(barn)
   addContactShadow(barn, 25, 20, 0.4, 3, 2)
   box(barn, matte(0x8c4432), 16, 5, 12, 0, 2.5, 0)
@@ -158,7 +102,7 @@ export function buildWorld(scene) {
   }
 
   const tower = new T.Group()
-  tower.position.set(LANDMARKS[1].x, 0, LANDMARKS[1].z)
+  tower.position.set(LANDMARKS[1].x, LANDMARKS[1].y, LANDMARKS[1].z)
   scene.add(tower)
   addContactShadow(tower, 11, 10, 0.3, 3, 2)
   const steel = matte(0x777b70)
@@ -170,31 +114,14 @@ export function buildWorld(scene) {
   lid.position.y = 22.65
   tower.add(lid)
 
-  const treeGeometries = [new T.IcosahedronGeometry(1, 0), new T.IcosahedronGeometry(1, 1)]
-  for (const [color, count] of [[0x697f4b, 530], [0x506843, 300]]) {
-    const material = terrainMaterial(color)
-    const batches = [[], []]
-    for (let i = 0; i < count; i++) {
-      const x = (random() - 0.5) * 2400
-      const z = (random() - 0.5) * 2400
-      const distance = Math.max(Math.abs(x), Math.abs(z))
-      if (distance < HALF_WORLD + 14) {
-        i--
-        continue
-      }
-      const scale = 2.8 + random() * 6
-      transforms.position.set(x, scale * 0.68, z)
-      transforms.scale.set(scale * 0.86, scale * 1.38, scale * 0.82)
-      transforms.rotation.y = random() * Math.PI
-      transforms.updateMatrix()
-      batches[Number(distance < HALF_WORLD + 150)].push(transforms.matrix.clone())
-    }
-    batches.forEach((matrices, i) => {
-      const trees = new T.InstancedMesh(treeGeometries[i], material, matrices.length)
-      matrices.forEach((matrix, index) => trees.setMatrixAt(index, matrix))
-      scene.add(trees)
-    })
-  }
+  // Shadows: everything on the ground receives them; the buildings and
+  // posts cast them (the trees and hedges: forest.js).
+  scene.traverse(object => {
+    if (!object.isMesh) return
+    object.receiveShadow = true
+    const caster = object.isInstancedMesh || object.parent === barn || object.parent === tower
+    if (caster) object.castShadow = true
+  })
 }
 
 function shell(parent, material, sections) {
@@ -223,7 +150,7 @@ export function buildCar(scene) {
   const body = new T.Group()
   root.add(body)
   scene.add(root)
-  addContactShadow(root, 4, 6.6, 0.74, -0.24, 0.12)
+  addContactShadow(root, 4, 6.6, 0.45, -0.24, 0.12) // (soft shade under it; the sun's shadow is the shadow map's)
   const red = new T.MeshStandardMaterial({ color: 0xc54e31, metalness: 0.32, roughness: 0.32 })
   const glass = new T.MeshStandardMaterial({ color: 0x203337, metalness: 0.38, roughness: 0.18 })
   const trim = matte(0x242729)
@@ -264,5 +191,37 @@ export function buildCar(scene) {
       wheels.push({ pivot, spin, front: z > 0 })
     }
   }
-  return { root, body, wheels, brakeMaterial }
+  // Headlights: a spotlight from each lamp, aimed a little down the road
+  // ahead (a dipped beam), and a soft glow on the lamp itself. Always in
+  // the scene (switching lights in and out would recompile every
+  // material); off is no brightness.
+  const beams = []
+  const glowMap = lampGlow()
+  for (const side of [-1, 1]) {
+    const beam = new T.SpotLight(0xfff1d8, 0, 140, 0.4, 0.5, 1.25)
+    beam.position.set(side * 0.54, 0.5, 2.2)
+    beam.target.position.set(side * 1.2, 0, 38)
+    root.add(beam, beam.target)
+    const glow = new T.Sprite(new T.SpriteMaterial({
+      map: glowMap, color: 0xfff4e2, transparent: true, opacity: 0, depthWrite: false, blending: T.AdditiveBlending, fog: false,
+    }))
+    glow.position.set(side * 0.54, 0.46, 2.22)
+    glow.scale.setScalar(1.1)
+    root.add(glow)
+    beams.push({ beam, glow })
+  }
+  return { root, body, wheels, brakeMaterial, lamps, beams }
+}
+
+function lampGlow() {
+  const canvas = document.createElement('canvas')
+  canvas.width = canvas.height = 64
+  const g = canvas.getContext('2d')
+  const gradient = g.createRadialGradient(32, 32, 0, 32, 32, 32)
+  gradient.addColorStop(0, 'rgba(255,255,255,1)')
+  gradient.addColorStop(0.18, 'rgba(255,248,230,0.75)')
+  gradient.addColorStop(1, 'rgba(255,240,210,0)')
+  g.fillStyle = gradient
+  g.fillRect(0, 0, 64, 64)
+  return new T.CanvasTexture(canvas)
 }

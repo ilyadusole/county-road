@@ -4,13 +4,22 @@ import { createSettings, keyLabel } from './settings.js'
 import { createCar, createStepper, interpolateCarPose, shiftGear, stepCar } from './vehicle.js'
 import { HALF_WORLD, LANDMARKS, PAD, SPAWN, isPaved, nearestRoad, resolveLandmarks, roads } from './roads.js'
 import { buildCar, buildWorld } from './scenery.js'
+import { createSky } from './sky.js'
+import { createSkySettings, loadSkySettings } from './skySettings.js'
+import { clockHours, dayOfYear, moonAge, seasonFor, weatherFor } from './weather.js'
+import { setGroundSeason } from './landscape.js'
+import { createGlare } from './glare.js'
+import { loadTextures } from './textures.js'
+import { TREE_QUALITY, buildForest } from './forest.js'
+import { RESOLUTION, createGraphicsSettings, loadGraphics } from './graphics.js'
+import { SHADOW_LEVELS, createShadows } from './shadows.js'
+import { HEDGES, POND, WOODS, heightAt, inPond, resolveTrees, slopeAt } from './terrain.js'
 
 const select = id => document.getElementById(id)
 const notice = select('notice')
 const view = select('view')
 const scene = new T.Scene()
-const camera = new T.PerspectiveCamera(56, 1, 0.15, 2100)
-const MAX_RENDER_PIXELS = 1920 * 1080
+const camera = new T.PerspectiveCamera(56, 1, 0.3, 4000)
 let renderer
 try {
   renderer = new T.WebGLRenderer({ antialias: true })
@@ -20,6 +29,12 @@ try {
   throw error
 }
 renderer.toneMapping = T.ACESFilmicToneMapping
+// Graphics quality (Settings → Graphics: graphics.js).
+const graphics = loadGraphics()
+renderer.shadowMap.enabled = graphics.shadows !== 'off'
+// Cascaded sun shadows (shadows.js), made once the world is built.
+let shadows = null
+renderer.shadowMap.type = T.PCFShadowMap
 view.append(renderer.domElement)
 const touch = createTouchDriving(select('game'))
 const drivingAudio = createDrivingAudio(select('open-settings'))
@@ -27,18 +42,36 @@ const drivingAudio = createDrivingAudio(select('open-settings'))
 function resize() {
   const { clientWidth, clientHeight } = view
   if (!clientWidth || !clientHeight) return
-  const mobile = touch.isActive()
-  const pixelBudget = mobile ? 1024 * 768 : MAX_RENDER_PIXELS
-  const pixelRatio = Math.min(devicePixelRatio, mobile ? 1 : 1.25, Math.sqrt(pixelBudget / (clientWidth * clientHeight)))
+  const { ratio, pixels } = RESOLUTION[graphics.resolution]
+  const pixelRatio = Math.min(devicePixelRatio, ratio, Math.sqrt(pixels / (clientWidth * clientHeight)))
   renderer.setDrawingBufferSize(clientWidth, clientHeight, pixelRatio)
   camera.aspect = clientWidth / clientHeight
   camera.updateProjectionMatrix()
+  shadows?.resize()
 }
 window.addEventListener('resize', resize)
 resize()
 
+const sky = createSky(scene)
+await loadTextures(renderer.capabilities.getMaxAnisotropy() >= 8 ? 8 : 4)
 buildWorld(scene)
+// Leafy trees and hedgerows (forest.js), at the chosen detail.
+const forest = buildForest(scene, renderer, TREE_QUALITY[graphics.trees])
+const glare = createGlare(view)
+const skySettings = loadSkySettings()
+createSkySettings(select('sky-options'), skySettings, applySky)
+createGraphicsSettings(select('graphics-options'), graphics, resize)
+applySky()
+let clockTimer = 0
 const model = buildCar(scene)
+if (graphics.shadows !== 'off') {
+  shadows = createShadows(scene, camera, sky, SHADOW_LEVELS[graphics.shadows])
+  shadows.setupScene()
+  shadows.setupMaterials(forest.materials)
+}
+model.root.traverse(object => {
+  if (object.isMesh && !object.material.transparent) object.castShadow = true
+})
 const bindings = loadBindings()
 const settings = createSettings(bindings, updateBindingHints)
 const controls = createControls(bindings, settings.isOpen)
@@ -57,6 +90,30 @@ const base = staticMap.getContext('2d')
 const mapScale = 0.219
 const mapX = x => map.width / 2 + x * mapScale
 const mapZ = z => map.height / 2 + z * mapScale
+// Relief: the hills shaded as if lit from the north-west, the woods and the pond.
+{
+  const relief = base.createImageData(map.width, map.height)
+  const step = 1 / mapScale
+  for (let py = 0; py < map.height; py++) {
+    for (let px = 0; px < map.width; px++) {
+      const x = (px - map.width / 2) / mapScale
+      const z = (py - map.height / 2) / mapScale
+      const h = heightAt(x, z)
+      const dx = (heightAt(x + step, z) - heightAt(x - step, z)) / (2 * step)
+      const dz = (heightAt(x, z + step) - heightAt(x, z - step)) / (2 * step)
+      const light = Math.max(-0.6, Math.min(0.6, (dx + dz) * -0.9))
+      const k = (py * map.width + px) * 4
+      const water = Math.hypot(x - POND.x, z - POND.z) < POND.radius && h < POND.level
+      const shade = 34 + h * 0.35 + light * 40
+      relief.data.set(water ? [40, 70, 78, 255] : [shade * 0.82, shade, shade * 0.74, 255], k)
+    }
+  }
+  base.putImageData(relief, 0, 0)
+  base.fillStyle = '#25331f'
+  for (const tree of WOODS) base.fillRect(mapX(tree.x) - 1, mapZ(tree.z) - 1, 2, 2)
+  base.fillStyle = '#2c3b24'
+  for (const bush of HEDGES) base.fillRect(mapX(bush.x) - 0.5, mapZ(bush.z) - 0.5, 1.2, 1.2)
+}
 base.lineWidth = 3.3
 base.lineJoin = 'round'
 base.lineCap = 'round'
@@ -87,6 +144,8 @@ const previousCar = { ...car }
 const pose = {}
 let input = controls()
 let cameraYaw
+let cameraHeight
+let carGround = 0
 let noticeUntil = 0
 let lastControllerStatus
 let lastHudAt = -Infinity
@@ -104,7 +163,7 @@ function setManualMode(manual) {
 
 function updateBindingHints() {
   const label = action => keyLabel(bindings.keys[action].find(Boolean))
-  select('keyboard-hint').textContent = `Keyboard · ${label('throttle')} throttle · ${label('brake')} brake · ${label('left')} / ${label('right')} steer · ${label('reverse')} reverse · ${label('reset')} recover · ${label('gearbox')} gearbox · ${label('shiftDown')} / ${label('shiftUp')} shift`
+  select('keyboard-hint').textContent = `Keyboard · ${label('throttle')} throttle · ${label('brake')} brake · ${label('left')} / ${label('right')} steer · ${label('reverse')} reverse · ${label('reset')} recover · ${label('gearbox')} gearbox · ${label('shiftDown')} / ${label('shiftUp')} shift · ${label('headlights')} lights`
 }
 
 function announce(message) {
@@ -119,22 +178,34 @@ function recover(message) {
   car.manual = manual
   Object.assign(previousCar, car)
   cameraYaw = undefined
+  cameraHeight = undefined
   announce(message)
 }
 
 const advance = createStepper(() => {
   Object.assign(previousCar, car)
-  stepCar(car, input, isPaved)
+  stepCar(car, input, isPaved, slopeAt)
   resolveLandmarks(car, previousCar.x, previousCar.z)
+  resolveTrees(car)
+  if (inPond(car.x, car.z)) recover('Into the pond · returned to the nearest road')
   if (Math.max(Math.abs(car.x), Math.abs(car.z)) > HALF_WORLD) recover('Map edge · returned to the nearest road')
 })
 
+// The car sits on the ground under its wheels: pitched and rolled with it.
 function renderCar() {
-  model.root.position.set(pose.x, 0.024, pose.z)
-  model.root.rotation.y = pose.heading
+  const sin = Math.sin(pose.heading)
+  const cos = Math.cos(pose.heading)
+  const at = (forward, right) => heightAt(pose.x + forward * sin - right * cos, pose.z + forward * cos + right * sin)
+  const front = (at(1.23, -0.8) + at(1.23, 0.8)) / 2
+  const rear = (at(-1.39, -0.8) + at(-1.39, 0.8)) / 2
+  const left = (at(1.23, -0.8) + at(-1.39, -0.8)) / 2
+  const right = (at(1.23, 0.8) + at(-1.39, 0.8)) / 2
+  carGround = (front * 1.39 + rear * 1.23) / 2.62
+  model.root.position.set(pose.x, carGround + 0.024, pose.z)
+  model.root.rotation.set(-Math.atan2(front - rear, 2.62), pose.heading, Math.atan2(left - right, 1.6), 'YXZ')
   model.body.rotation.x = -pose.ax * 0.0055
   model.body.rotation.z = -pose.ay * 0.006
-  model.brakeMaterial.emissiveIntensity = 0.55 + 2.4 * input.brake
+  model.brakeMaterial.emissiveIntensity = 0.55 + 0.45 * headlightLevel + 2.4 * input.brake
   for (const { pivot, spin, front } of model.wheels) {
     if (front) pivot.rotation.y = -pose.steer
     spin.rotation.x = pose.wheelAngle
@@ -149,8 +220,14 @@ function updateCamera(delta) {
   const sin = Math.sin(cameraYaw)
   const cos = Math.cos(cameraYaw)
   const distance = 7.2 + Math.min(1.8, Math.abs(pose.u) * 0.035)
-  camera.position.set(pose.x - sin * distance, 3.26 + input.lookY * 1.3, pose.z - cos * distance)
-  focus.set(pose.x + sin * 2.3, 0.88, pose.z + cos * 2.3)
+  // Following the car's height, eased, and never inside a hillside.
+  const x = pose.x - sin * distance
+  const z = pose.z - cos * distance
+  cameraHeight ??= carGround
+  cameraHeight += (carGround - cameraHeight) * (1 - Math.exp(-6 * delta))
+  const y = Math.max(cameraHeight + 3.26 + input.lookY * 1.3, heightAt(x, z) + 1.4)
+  camera.position.set(x, y, z)
+  focus.set(pose.x + sin * 2.3, cameraHeight + 0.88, pose.z + cos * 2.3)
   camera.lookAt(focus)
 }
 
@@ -208,6 +285,8 @@ renderer.setAnimationLoop(now => {
   settings.update(input.devices)
   if (paused) {
     drivingAudio.update(now, car, input, true)
+    updateSky(delta, true)
+    renderer.render(scene, camera)
     return
   }
   if (input.reset) recover('Recovered to the nearest road')
@@ -222,14 +301,85 @@ renderer.setAnimationLoop(now => {
     }
   }
   if (input.shiftUp !== input.shiftDown) shiftGear(car, input.shiftUp ? 1 : -1)
+  if (input.headlights) {
+    // Switched by hand: the opposite of what they are now (until the next reload).
+    headlightsManual = !headlightsWanted()
+    announce(headlightsManual ? 'Headlights on' : 'Headlights off')
+  }
   const fraction = advance(delta)
   drivingAudio.update(now, car, input, false)
   interpolateCarPose(previousCar, car, fraction, pose)
   renderCar()
   updateCamera(delta)
   updateHud(now)
+  updateSky(delta, false)
   renderer.render(scene, camera)
 })
+
+/** Apply the sky and weather settings (skySettings.js) to the world. */
+function applySky() {
+  const o = skySettings
+  const now = new Date()
+  const hours = o.useClock ? clockHours(now) : Number(o.timeOfDay)
+  const day = o.useClock ? dayOfYear(now) : Number(o.dayOfYear)
+  // The moon by the date (this year, at that time of day), or as chosen.
+  const date = new Date(now.getFullYear(), 0, day, Math.floor(hours), (hours % 1) * 60)
+  const age = { new: 0, crescent: 0.15, quarter: 0.25, gibbous: 0.37, full: 0.5 }[o.moonPhase]
+    ?? moonAge(o.useClock ? now : date)
+  sky.setStars(o.stars)
+  sky.setClouds(Number(o.cloudCover), o.cloudType)
+  sky.setTime(hours, day, age)
+  sky.setWind(Number(o.windSpeed), Number(o.windDir))
+  sky.setWeather(weatherFor(o, day, hours))
+  const season = seasonFor(day)
+  setGroundSeason(season)
+  forest.setSeason(day, season)
+}
+
+// Headlights: on by themselves at dusk, at night and in mist or low cloud,
+// unless switched by hand (null = automatic).
+let headlightsManual = null
+let headlightLevel = 0
+function headlightsWanted() {
+  if (headlightsManual !== null) return headlightsManual
+  const s = sky.state
+  return s.sunElevation < 3 || s.fogNow > 0.2 || s.weather.mist > 0.3 || (s.lowCloudCover ?? 0) > 0.5
+}
+
+function updateHeadlights(delta) {
+  // They come up in a moment rather than instantly, like real bulbs.
+  headlightLevel += (Number(headlightsWanted()) - headlightLevel) * (1 - Math.exp(-delta * 14))
+  const on = headlightLevel
+  // The lamps' glow shows only from in front of the car.
+  const facing = Math.sin(pose.heading) * (camera.position.x - pose.x) + Math.cos(pose.heading) * (camera.position.z - pose.z)
+  const fromFront = Math.min(1, Math.max(0, (facing - 1.5) / 3))
+  for (const { beam, glow } of model.beams) {
+    beam.intensity = 650 * on
+    glow.material.opacity = 0.9 * on * fromFront
+  }
+  model.lamps.emissiveIntensity = 0.6 + 3.4 * on
+}
+
+function updateSky(delta, paused) {
+  // Following the clock: move the sun along every half minute.
+  if (skySettings.useClock && (clockTimer -= delta) <= 0) {
+    clockTimer = 30
+    applySky()
+  }
+  sky.update(paused ? 0 : delta, camera, heightAt(camera.position.x, camera.position.z))
+  const far = Math.min(4000, sky.state.visibleFar)
+  if (Math.abs(camera.far - far) > 1) {
+    camera.far = far
+    camera.updateProjectionMatrix()
+    shadows?.resize()
+  }
+  shadows?.update()
+  glare.update(camera, sky.state, delta, skySettings.sunGlare)
+  updateHeadlights(delta)
+  forest.update(camera.position)
+  forest.setWind(performance.now() / 1000, Number(skySettings.windSpeed), Number(skySettings.windDir))
+  renderer.toneMappingExposure = sky.state.exposure
+}
 
 function createDrivingAudio(settingsButton) {
   const toolbar = document.createElement('div')
